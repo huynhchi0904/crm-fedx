@@ -1,0 +1,21 @@
+import type { CustomFieldDataType } from "./custom-field.types";
+
+export type SystemFormField = {
+  key: string;
+  label: string;
+  dataType: CustomFieldDataType;
+  storage: string;
+  isRequired?: boolean;
+  requiredLocked?: boolean;
+  isSensitive?: boolean;
+  optionSource?: string;
+  note?: string;
+  readOnly?: boolean;
+};
+
+export type SystemFormFieldGroup = {
+  id: string;
+  label: string;
+  description: string;
+  fields: SystemFormField[];
+};

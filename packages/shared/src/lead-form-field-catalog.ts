@@ -1,0 +1,178 @@
+export type LeadSystemField = {
+  key: string;
+  label: string;
+  dataType: "TEXT" | "TEXTAREA" | "NUMBER" | "DATE" | "BOOLEAN" | "EMAIL" | "PHONE" | "SELECT" | "MULTI_SELECT";
+  storage: string;
+  isRequired?: boolean;
+  requiredLocked?: boolean;
+  isSensitive?: boolean;
+  optionSource?: string;
+  note?: string;
+  /** Filled by inbound integrations only; never rendered as a Lead form input or requirement toggle. */
+  readOnly?: boolean;
+};
+
+export type LeadSystemFieldGroup = {
+  id: string;
+  label: string;
+  description: string;
+  fields: LeadSystemField[];
+};
+
+const field = (
+  key: string,
+  label: string,
+  dataType: LeadSystemField["dataType"],
+  storage: string,
+  config: Omit<LeadSystemField, "key" | "label" | "dataType" | "storage"> = {},
+): LeadSystemField => ({ key, label, dataType, storage, ...config });
+
+export const leadFormFieldCatalog: LeadSystemFieldGroup[] = [
+  {
+    id: "basic",
+    label: "Thông tin cơ bản",
+    description: "Thông tin nhận diện và liên hệ của lead.",
+    fields: [
+      field("fullName", "Họ và tên", "TEXT", "leads.full_name", { isRequired: true, requiredLocked: true }),
+      field("phone", "Số điện thoại", "PHONE", "leads.phone", { isRequired: true, requiredLocked: true, isSensitive: true }),
+      field("sourceId", "Nguồn học viên", "SELECT", "leads.source_id", { isRequired: true, requiredLocked: true, optionSource: "lead_sources" }),
+      field("email", "Email", "EMAIL", "leads.email", { isSensitive: true }),
+      field("gender", "Giới tính", "SELECT", "leads.gender", { optionSource: "Danh sách cố định" }),
+      field("dateOfBirth", "Ngày sinh", "DATE", "leads.date_of_birth", { isSensitive: true }),
+      field("birthPlace", "Nơi sinh", "TEXT", "student_profiles.birth_place"),
+      field("cccd", "CCCD", "TEXT", "leads.cccd", { isSensitive: true }),
+      field("cccdIssueDate", "Ngày cấp CCCD", "DATE", "student_profiles.cccd_issue_date", { isSensitive: true }),
+      field("cccdIssuePlace", "Nơi cấp CCCD", "TEXT", "student_profiles.cccd_issue_place", { isSensitive: true }),
+      field("ethnicity", "Dân tộc", "TEXT", "student_profiles.ethnicity"),
+      field("religion", "Tôn giáo", "TEXT", "student_profiles.religion"),
+      field("nationality", "Quốc tịch", "TEXT", "student_profiles.nationality"),
+      field("specificAddress", "Địa chỉ cụ thể", "TEXTAREA", "addresses.detail_address", { isSensitive: true, note: "Bản ghi địa chỉ loại specific" }),
+    ],
+  },
+  {
+    id: "education",
+    label: "Học vấn và tốt nghiệp",
+    description: "Thông tin trường THPT, văn bằng và kết quả tốt nghiệp.",
+    fields: [
+      field("graduationYear", "Năm tốt nghiệp", "NUMBER", "student_profiles.graduation_year"),
+      field("graduationCertificate", "Bằng tốt nghiệp", "TEXT", "student_profiles.graduation_certificate"),
+      field("previousGraduationCertificate", "Bằng tốt nghiệp cũ", "TEXT", "student_profiles.previous_graduation_certificate"),
+      field("diplomaIssuePlace", "Nơi cấp bằng", "TEXT", "student_profiles.diploma_issue_place"),
+      field("graduationMajor", "Ngành tốt nghiệp", "TEXT", "student_profiles.graduation_major"),
+      field("graduationRank", "Xếp loại tốt nghiệp", "TEXT", "student_profiles.graduation_rank"),
+      field("academicRank12", "Xếp loại học lực lớp 12", "TEXT", "student_profiles.academic_rank_12"),
+      field("conductRank12", "Xếp loại hạnh kiểm lớp 12", "TEXT", "student_profiles.conduct_rank_12"),
+      field("highSchoolName", "Trường THPT", "TEXT", "student_profiles.high_school_name"),
+      field("highSchoolDistrict", "Quận/huyện của trường THPT", "TEXT", "student_profiles.high_school_district"),
+      field("highSchoolProvince", "Tỉnh/TP của trường THPT", "TEXT", "student_profiles.high_school_province"),
+    ],
+  },
+  {
+    id: "current-address",
+    label: "Địa chỉ và công việc hiện nay",
+    description: "Nơi cư trú hiện tại và thông tin công tác.",
+    fields: [
+      field("hamlet", "Ấp/Thôn", "TEXT", "addresses.hamlet", { note: "Bản ghi địa chỉ loại current" }),
+      field("ward", "Xã/Phường", "TEXT", "addresses.ward", { note: "Bản ghi địa chỉ loại current" }),
+      field("district", "Thị xã/Huyện", "TEXT", "addresses.district", { note: "Bản ghi địa chỉ loại current" }),
+      field("province", "Tỉnh/Thành phố", "TEXT", "addresses.province", { note: "Bản ghi địa chỉ loại current" }),
+      field("currentAddress", "Địa chỉ hiện nay", "TEXTAREA", "addresses.detail_address", { isSensitive: true, note: "Bản ghi địa chỉ loại current" }),
+      field("permanentAddress", "Địa chỉ thường trú", "TEXTAREA", "addresses.detail_address", { isSensitive: true, note: "Bản ghi địa chỉ loại permanent" }),
+      field("currentResidence", "Nơi ở hiện tại", "TEXTAREA", "addresses.detail_address", { isSensitive: true, note: "Bản ghi địa chỉ loại residence" }),
+      field("currentJob", "Công việc hiện nay", "TEXT", "student_profiles.current_job"),
+      field("companyName", "Cơ quan công tác", "TEXT", "student_profiles.company_name"),
+    ],
+  },
+  {
+    id: "relatives",
+    label: "Người thân đại diện",
+    description: "Hai người liên hệ đại diện của lead.",
+    fields: [
+      field("relative1FullName", "Người thân 1 - Họ và tên", "TEXT", "relatives.full_name", { isSensitive: true, note: "Người thân chính" }),
+      field("relative1Relationship", "Người thân 1 - Mối quan hệ", "TEXT", "relatives.relationship", { note: "Người thân chính" }),
+      field("relative1Phone", "Người thân 1 - Điện thoại", "PHONE", "relatives.phone", { isSensitive: true, note: "Người thân chính" }),
+      field("relative1Job", "Người thân 1 - Nghề nghiệp", "TEXT", "relatives.job", { note: "Người thân chính" }),
+      field("relative1Address", "Người thân 1 - Địa chỉ", "TEXTAREA", "relatives.address_id", { isSensitive: true, note: "Liên kết tới addresses.detail_address" }),
+      field("relative2FullName", "Người thân 2 - Họ và tên", "TEXT", "relatives.full_name", { isSensitive: true, note: "Người thân phụ" }),
+      field("relative2Relationship", "Người thân 2 - Mối quan hệ", "TEXT", "relatives.relationship", { note: "Người thân phụ" }),
+      field("relative2Phone", "Người thân 2 - Điện thoại", "PHONE", "relatives.phone", { isSensitive: true, note: "Người thân phụ" }),
+      field("relative2Job", "Người thân 2 - Nghề nghiệp", "TEXT", "relatives.job", { note: "Người thân phụ" }),
+      field("relative2Address", "Người thân 2 - Địa chỉ", "TEXTAREA", "relatives.address_id", { isSensitive: true, note: "Liên kết tới addresses.detail_address" }),
+    ],
+  },
+  {
+    id: "admission",
+    label: "Thông tin tuyển sinh",
+    description: "Thông tin ngành, hồ sơ và kết quả xét tuyển.",
+    fields: [
+      field("majorId", "Ngành đăng ký", "SELECT", "leads.major_id + admission_profiles.major_id", { optionSource: "majors" }),
+      field("admissionStatusId", "Trạng thái hồ sơ", "SELECT", "admission_profiles.admission_status_id", { optionSource: "admission_statuses" }),
+      field("trainingCode", "Mã đào tạo", "TEXT", "admission_profiles.training_code"),
+      field("classCode", "Mã lớp", "TEXT", "admission_profiles.class_code"),
+      field("subjectGroupCode", "Mã tổ hợp môn", "TEXT", "admission_profiles.subject_group_code"),
+      field("subjectGroupName", "Tên tổ hợp môn", "TEXT", "admission_profiles.subject_group_name"),
+      field("score1", "Điểm TH1", "NUMBER", "admission_profiles.score_1"),
+      field("score2", "Điểm TH2", "NUMBER", "admission_profiles.score_2"),
+      field("score3", "Điểm TH3", "NUMBER", "admission_profiles.score_3"),
+      field("admissionScore", "Điểm xét tuyển", "NUMBER", "admission_profiles.admission_score"),
+      field("enrollmentBatch", "Đợt khai giảng", "TEXT", "admission_profiles.enrollment_batch"),
+      field("registrationStation", "Trạm đăng ký", "TEXT", "admission_profiles.registration_station"),
+      field("decisionNumber", "Số quyết định", "TEXT", "admission_profiles.decision_number"),
+      field("decisionSignedDate", "Ngày ký quyết định", "DATE", "admission_profiles.decision_signed_date"),
+      field("monthlyRevenue", "Doanh số tháng", "DATE", "admission_profiles.monthly_revenue"),
+    ],
+  },
+  {
+    id: "classification",
+    label: "Chăm sóc và phân loại",
+    description: "Thông tin phục vụ telesale, marketing và phân loại lead.",
+    fields: [
+      field("pipelineStageId", "Quy trình Telesale", "SELECT", "leads.pipeline_stage_id → pipeline_stages.id", { optionSource: "Danh sách giai đoạn pipeline" }),
+      field("temperature", "Mức độ quan tâm", "TEXT", "leads.temperature"),
+      field("gclid", "Gclid", "TEXT", "utm_trackings.gclid"),
+      field("tags", "Tags", "MULTI_SELECT", "entity_tags + tags", { optionSource: "tags" }),
+      field("note", "Ghi chú", "TEXTAREA", "leads.note"),
+    ],
+  },
+  {
+    id: "additional",
+    label: "Thông tin bổ sung",
+    description: "Chương trình áp dụng và các trường dữ liệu tự cấu hình.",
+    fields: [
+      field("institutionProgramId", "Chương trình tuyển sinh", "SELECT", "leads.institution_program_id + admission_profiles.institution_program_id", { optionSource: "institution_programs" }),
+    ],
+  },
+];
+
+/**
+ * Customer source data received from webhooks. Kept out of leadFormFieldCatalog so Lead forms,
+ * filters, automations and reports do not treat these keys as editable Lead columns.
+ */
+export const leadSourceFieldGroup: LeadSystemFieldGroup = {
+  id: "customer-source",
+  label: "Nguồn khách hàng",
+  description: "Dữ liệu nguồn nhận qua webhook, hệ thống tự ghi nhận cho mỗi lần Lead phát sinh.",
+  fields: [
+    field("originId", "Nhóm nguồn", "SELECT", "leads.origin_id → lead_origins", {
+      readOnly: true,
+      optionSource: "lead_origins",
+      note: "Hệ thống tự xác định từ URL nhóm nguồn; không nhận diện được thì ghi nhận là “Khác”.",
+    }),
+    field("source", "Nguồn", "SELECT", "lead_source_occurrences.channel_id → lead_channels", {
+      readOnly: true,
+      optionSource: "lead_channels",
+      note: "Chọn từ danh mục Nguồn của chương trình; giá trị mới nhận từ webhook được tự thêm và đánh dấu *.",
+    }),
+    field("sourceGroupUrl", "URL xác định nhóm nguồn", "TEXT", "Không lưu riêng", {
+      readOnly: true,
+      note: "Dùng tham số utm_source trong URL để xác định Nhóm nguồn.",
+    }),
+  ],
+};
+
+/** Lead structure shown on the field configuration page: form groups plus read-only source data. */
+export const leadFieldConfigurationCatalog: LeadSystemFieldGroup[] = [
+  leadFormFieldCatalog[0],
+  leadSourceFieldGroup,
+  ...leadFormFieldCatalog.slice(1),
+];

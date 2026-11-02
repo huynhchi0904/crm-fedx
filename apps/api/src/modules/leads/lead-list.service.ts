@@ -1,0 +1,1043 @@
+import { leadHistoryActorLabel } from "./lead-history-actor";
+import { formatLeadChannelName } from "@admission-crm/shared/lead-channel";
+import { describeLeadCreation, recordObject } from "./lead-creation-history";
+import { leadCreationActions, loadLeadCreationHistory, resolveLeadCreationNames } from "./lead-creation-history.service";
+import { isEnrolledStudent, studentMembershipWhere } from "../students/student-membership";
+import type { Prisma } from "../../generated/prisma/client";
+import type { AuthUser } from "../auth/auth.types";
+import { prisma } from "../../database/prisma";
+import {
+  ACTIVE_LEAD_STATUS,
+  FAILED_LEAD_STATUS_PREFIX,
+  getFailedLeadStageId,
+  toLeadLifecycleStatus,
+} from "./domain/lead-lifecycle-status";
+import { buildLeadFilterWhere, type FilterCondition } from "./lead-filter.service";
+import { getLeadCustomFieldDefinitions } from "./lead-custom-fields.service";
+import { listActiveLeadChannelOptions } from "../campaigns/lead-channel.service";
+import { listVisibleUnmatchedValues } from "./lead-unmatched-values.service";
+
+export const leadListPermissions = [
+  "lead.view_all",
+  "lead.view_department",
+  "lead.view_assigned",
+] as const;
+
+const sensitiveLeadPermissions = new Set([
+  "lead.sensitive.view",
+  "lead.update_all",
+  "lead.update_department",
+  "lead.update_assigned",
+]);
+
+export type LeadListQuery = {
+  audience?: "candidates" | "students" | "all";
+  page: number;
+  limit: number;
+  search?: string;
+  pipelineStageId?: string;
+  status?: "ACTIVE" | "FAIL";
+  sourceId?: string;
+  majorId?: string;
+  institutionProgramId?: string;
+  assigneeId?: string;
+  fromDate?: string;
+  toDate?: string;
+  filterConditions?: FilterCondition[];
+  sortBy: "createdAt" | "fullName" | "leadCode" | "pipelineStage";
+  sortOrder: "asc" | "desc";
+};
+
+const leadSortFields = {
+  createdAt: "created_at",
+  fullName: "full_name",
+  leadCode: "lead_code",
+} as const;
+
+function canViewSensitiveLeadData(user: AuthUser) {
+  return user.permissions.some((permission) => sensitiveLeadPermissions.has(permission));
+}
+
+export function getLeadScopeWhere(
+  user: AuthUser,
+  institutionProgramId?: string,
+) {
+  const permissions = new Set(user.permissions);
+  const assignedScope = {
+    OR: [
+      { assigned_to: user.id },
+      { secondary_assigned_to: user.id },
+      { lead_assignments: { some: { assigned_to: user.id, is_main_owner: true } } },
+    ],
+  };
+  // Scope can restrict an explicit permission, but cannot grant a broader one.
+  if (!permissions.has("lead.view_all") && !permissions.has("lead.view_department")) {
+    return permissions.has("lead.view_assigned") ? assignedScope : { id: "00000000-0000-4000-8000-000000000000" };
+  }
+
+
+  if (user.accessScope === "ALL" && permissions.has("lead.view_all")) {
+    return {};
+  }
+
+  if (user.accessScope === "OWNED_ONLY") {
+    return { owner_id: user.id };
+  }
+
+  if (["ALL", "DEPARTMENT"].includes(user.accessScope)) {
+    if (user.departmentIds.length === 0) return { id: "00000000-0000-4000-8000-000000000000" };
+    const departmentScope = {
+      lead_assignments: {
+        some: {
+          department_id: { in: user.departmentIds },
+          is_main_owner: true,
+        },
+      },
+    };
+    if (
+      !institutionProgramId ||
+      !user.institutionProgramIds.includes(institutionProgramId)
+    ) {
+      return departmentScope;
+    }
+
+    return {
+      OR: [
+        departmentScope,
+        {
+          institution_program_id: institutionProgramId,
+          assigned_to: null,
+          lead_assignments: { none: { is_main_owner: true } },
+        },
+      ],
+    };
+  }
+
+  return assignedScope;
+}
+
+export async function buildLeadListWhere(
+  user: AuthUser,
+  query: Omit<LeadListQuery, "page" | "limit" | "sortBy" | "sortOrder">,
+  additionalWhere?: Prisma.leadsWhereInput,
+) {
+  const canViewSensitive = canViewSensitiveLeadData(user);
+  const conditionWhere = await buildLeadFilterWhere(user, query.filterConditions ?? [], canViewSensitive);
+
+  const where = {
+    AND: [
+      { deleted_at: null },
+      studentMembershipWhere(query.audience),
+      getLeadScopeWhere(user, query.institutionProgramId),
+      ...(query.search
+        ? [
+            {
+              OR: [
+                { full_name: { contains: query.search, mode: "insensitive" as const } },
+                { lead_code: { contains: query.search, mode: "insensitive" as const } },
+                ...(canViewSensitive
+                  ? [
+                      { phone: { contains: query.search, mode: "insensitive" as const } },
+                      { secondary_phones: { has: query.search.trim() } },
+                      { email: { contains: query.search, mode: "insensitive" as const } },
+                    ]
+                  : []),
+              ],
+            },
+          ]
+        : []),
+      ...(query.pipelineStageId ? [{ pipeline_stage_id: query.pipelineStageId }] : []),
+      ...(query.status === "FAIL"
+        ? [{ status: { startsWith: FAILED_LEAD_STATUS_PREFIX } }]
+        : query.status === "ACTIVE" || query.pipelineStageId
+          ? [{ status: ACTIVE_LEAD_STATUS }]
+          : []),
+      ...(query.sourceId ? [{ source_id: query.sourceId }] : []),
+      ...(query.majorId
+        ? [{
+            OR: [
+              { major_id: query.majorId },
+              { admission_profiles: { is: { major_id: query.majorId } } },
+            ],
+          }]
+        : []),
+      ...(query.institutionProgramId ? [{ institution_program_id: query.institutionProgramId }] : []),
+      ...(query.assigneeId
+        ? [{ OR: [{ assigned_to: query.assigneeId }, { secondary_assigned_to: query.assigneeId }] }]
+        : []),
+      ...(query.fromDate ? [{ created_at: { gte: new Date(`${query.fromDate}T00:00:00.000Z`) } }] : []),
+      ...(query.toDate ? [{ created_at: { lte: new Date(`${query.toDate}T23:59:59.999Z`) } }] : []),
+      ...(conditionWhere ? [conditionWhere] : []),
+      ...(additionalWhere ? [additionalWhere] : []),
+    ],
+  };
+  return where;
+}
+
+export async function listLeads(user: AuthUser, query: LeadListQuery, additionalWhere?: Prisma.leadsWhereInput) {
+  const canViewSensitive = canViewSensitiveLeadData(user);
+  const where = await buildLeadListWhere(user, query, additionalWhere);
+  const orderBy = query.sortBy === "pipelineStage"
+    ? { pipeline_stages: { position: query.sortOrder } }
+    : { [leadSortFields[query.sortBy]]: query.sortOrder };
+  const skip = (query.page - 1) * query.limit;
+
+  const [items, total] = await prisma.$transaction([
+    prisma.leads.findMany({
+      where,
+      select: {
+        students: { select: { status: true } },
+        id: true,
+        lead_code: true,
+        full_name: true,
+        status: true,
+        phone: true,
+        secondary_phones: true,
+        email: true,
+        gender: true,
+        date_of_birth: true,
+        cccd: true,
+        note: true,
+        lead_notes: {
+          select: { content: true },
+          orderBy: [{ created_at: "desc" }, { id: "desc" }],
+          take: 1,
+        },
+        temperature: true,
+        created_at: true,
+        majors: { select: { id: true, name: true } },
+        institution_programs: {
+          select: { id: true, name: true, institution_name: true },
+        },
+        lead_sources: {
+          select: {
+            id: true,
+            name: true,
+          },
+        },
+        lead_origins: { select: { id: true, name: true } },
+        pipeline_stages: {
+          select: {
+            id: true,
+            name: true,
+            color: true,
+          },
+        },
+        users_leads_assigned_toTousers: {
+          select: {
+            id: true,
+            full_name: true,
+          },
+        },
+        users_leads_secondary_assigned_toTousers: {
+          select: {
+            id: true,
+            full_name: true,
+          },
+        },
+        student_profiles: {
+          select: {
+            birth_place: true,
+            nationality: true,
+            ethnicity: true,
+            religion: true,
+            cccd_issue_date: true,
+            cccd_issue_place: true,
+            graduation_year: true,
+            graduation_certificate: true,
+            previous_graduation_certificate: true,
+            graduation_major: true,
+            graduation_rank: true,
+            diploma_issue_place: true,
+            academic_rank_12: true,
+            conduct_rank_12: true,
+            high_school_name: true,
+            high_school_province: true,
+            high_school_district: true,
+            current_job: true,
+            company_name: true,
+          },
+        },
+        addresses: {
+          select: { type: true, province: true, district: true, ward: true, hamlet: true, detail_address: true },
+        },
+        relatives: {
+          select: {
+            full_name: true,
+            relationship: true,
+            phone: true,
+            job: true,
+            is_primary: true,
+            addresses: { select: { detail_address: true } },
+          },
+        },
+        admission_profiles: {
+          select: {
+            training_code: true,
+            class_code: true,
+            subject_group_code: true,
+            subject_group_name: true,
+            score_1: true,
+            score_2: true,
+            score_3: true,
+            admission_score: true,
+            enrollment_batch: true,
+            registration_station: true,
+            decision_number: true,
+            decision_signed_date: true,
+            monthly_revenue: true,
+            majors: { select: { name: true } },
+            admission_statuses: { select: { name: true } },
+          },
+        },
+        utm_trackings: { select: { gclid: true }, orderBy: { created_at: "asc" }, take: 1 },
+      },
+      orderBy: [orderBy, { id: "asc" }],
+      skip,
+      take: query.limit,
+    }),
+    prisma.leads.count({ where }),
+  ]);
+  const tagRelations = items.length === 0
+    ? []
+    : await prisma.entity_tags.findMany({
+        where: { entity_type: "lead", entity_id: { in: items.map((lead) => lead.id) } },
+        select: { entity_id: true, tags: { select: { name: true } } },
+        orderBy: { created_at: "asc" },
+      });
+  const tagsByLeadId = new Map<string, string[]>();
+  for (const relation of tagRelations) {
+    if (!relation.tags) {
+      continue;
+    }
+    const tags = tagsByLeadId.get(relation.entity_id) ?? [];
+    tags.push(relation.tags.name);
+    tagsByLeadId.set(relation.entity_id, tags);
+  }
+  const failedStageIds = [...new Set(items.flatMap((lead) => {
+    const stageId = getFailedLeadStageId(lead.status);
+    return stageId ? [stageId] : [];
+  }))];
+  const failedStages = failedStageIds.length === 0
+    ? []
+    : await prisma.pipeline_stages.findMany({
+        where: { id: { in: failedStageIds } },
+        select: { id: true, name: true },
+      });
+  const failedStageNames = new Map(failedStages.map((stage) => [stage.id, stage.name]));
+
+  return {
+    data: items.map((lead) => {
+      const profile = lead.student_profiles;
+      const specificAddress = lead.addresses.find((address) => address.type === "specific");
+      const permanentAddress = lead.addresses.find((address) => address.type === "permanent");
+      const currentAddress = lead.addresses.find((address) => address.type === "current");
+      const currentResidence = lead.addresses.find((address) => address.type === "residence");
+      const primaryRelative = lead.relatives.find((relative) => relative.is_primary);
+      const secondaryRelative = lead.relatives.find((relative) => !relative.is_primary);
+      const admission = lead.admission_profiles;
+
+      return {
+        recordType: isEnrolledStudent(lead.students) ? "student" : "candidate",
+      id: lead.id,
+        leadCode: lead.lead_code,
+        fullName: lead.full_name,
+        lifecycleStatus: toLeadLifecycleStatus(lead.status, failedStageNames.get(getFailedLeadStageId(lead.status) ?? "")),
+        phone: canViewSensitive ? lead.phone : null,
+        secondaryPhones: canViewSensitive ? lead.secondary_phones : [],
+        email: canViewSensitive ? lead.email : null,
+        gender: lead.gender,
+        dateOfBirth: lead.date_of_birth?.toISOString().slice(0, 10) ?? null,
+        birthPlace: profile?.birth_place ?? null,
+        cccd: canViewSensitive ? lead.cccd : null,
+        cccdIssueDate: canViewSensitive ? profile?.cccd_issue_date?.toISOString().slice(0, 10) ?? null : null,
+        cccdIssuePlace: canViewSensitive ? profile?.cccd_issue_place ?? null : null,
+        nationality: profile?.nationality ?? null,
+        ethnicity: profile?.ethnicity ?? null,
+        religion: profile?.religion ?? null,
+        specificAddress: canViewSensitive ? specificAddress?.detail_address ?? null : null,
+        graduationYear: profile?.graduation_year?.toString() ?? null,
+        graduationCertificate: profile?.graduation_certificate ?? null,
+        previousGraduationCertificate: profile?.previous_graduation_certificate ?? null,
+        graduationMajor: profile?.graduation_major ?? null,
+        graduationRank: profile?.graduation_rank ?? null,
+        diplomaIssuePlace: profile?.diploma_issue_place ?? null,
+        academicRank12: profile?.academic_rank_12 ?? null,
+        conductRank12: profile?.conduct_rank_12 ?? null,
+        highSchoolName: profile?.high_school_name ?? null,
+        highSchoolProvince: profile?.high_school_province ?? null,
+        highSchoolDistrict: profile?.high_school_district ?? null,
+        province: canViewSensitive ? currentAddress?.province ?? null : null,
+        district: canViewSensitive ? currentAddress?.district ?? null : null,
+        ward: canViewSensitive ? currentAddress?.ward ?? null : null,
+        hamlet: canViewSensitive ? currentAddress?.hamlet ?? null : null,
+        currentAddress: canViewSensitive ? currentAddress?.detail_address ?? null : null,
+        permanentAddress: canViewSensitive ? permanentAddress?.detail_address ?? null : null,
+        currentResidence: canViewSensitive ? currentResidence?.detail_address ?? null : null,
+        currentJob: profile?.current_job ?? null,
+        companyName: profile?.company_name ?? null,
+        relative1FullName: canViewSensitive ? primaryRelative?.full_name ?? null : null,
+        relative1Relationship: canViewSensitive ? primaryRelative?.relationship ?? null : null,
+        relative1Phone: canViewSensitive ? primaryRelative?.phone ?? null : null,
+        relative1Job: primaryRelative?.job ?? null,
+        relative1Address: canViewSensitive ? primaryRelative?.addresses?.detail_address ?? null : null,
+        relative2FullName: canViewSensitive ? secondaryRelative?.full_name ?? null : null,
+        relative2Relationship: canViewSensitive ? secondaryRelative?.relationship ?? null : null,
+        relative2Phone: canViewSensitive ? secondaryRelative?.phone ?? null : null,
+        relative2Job: secondaryRelative?.job ?? null,
+        relative2Address: canViewSensitive ? secondaryRelative?.addresses?.detail_address ?? null : null,
+        majorName: admission?.majors?.name ?? lead.majors?.name ?? null,
+        institutionProgram: lead.institution_programs
+          ? {
+              id: lead.institution_programs.id,
+              name: lead.institution_programs.name,
+              institutionName: lead.institution_programs.institution_name,
+            }
+          : null,
+        admissionStatusName: admission?.admission_statuses?.name ?? null,
+        trainingCode: admission?.training_code ?? null,
+        classCode: admission?.class_code ?? null,
+        subjectGroupCode: admission?.subject_group_code ?? null,
+        subjectGroupName: admission?.subject_group_name ?? null,
+        score1: admission?.score_1?.toString() ?? null,
+        score2: admission?.score_2?.toString() ?? null,
+        score3: admission?.score_3?.toString() ?? null,
+        admissionScore: admission?.admission_score?.toString() ?? null,
+        enrollmentBatch: admission?.enrollment_batch ?? null,
+        registrationStation: admission?.registration_station ?? null,
+        decisionNumber: admission?.decision_number ?? null,
+        decisionSignedDate: admission?.decision_signed_date?.toISOString().slice(0, 10) ?? null,
+        monthlyRevenue: admission?.monthly_revenue?.toISOString().slice(0, 10) ?? null,
+        gclid: lead.utm_trackings[0]?.gclid ?? null,
+        tags: (tagsByLeadId.get(lead.id) ?? []).join(", "),
+        note: lead.note,
+        latestNote: lead.lead_notes[0]?.content ?? lead.note,
+        temperature: lead.temperature,
+        source: lead.lead_sources
+          ? { id: lead.lead_sources.id, name: lead.lead_sources.name }
+          : null,
+        origin: lead.lead_origins
+          ? { id: lead.lead_origins.id, name: lead.lead_origins.name }
+          : null,
+        pipelineStage: lead.pipeline_stages
+          ? {
+              id: lead.pipeline_stages.id,
+              name: lead.pipeline_stages.name,
+              color: lead.pipeline_stages.color,
+            }
+          : null,
+        assignee: lead.users_leads_assigned_toTousers
+          ? {
+              id: lead.users_leads_assigned_toTousers.id,
+              fullName: lead.users_leads_assigned_toTousers.full_name,
+            }
+          : null,
+        secondaryAssignee: lead.users_leads_secondary_assigned_toTousers
+          ? {
+              id: lead.users_leads_secondary_assigned_toTousers.id,
+              fullName: lead.users_leads_secondary_assigned_toTousers.full_name,
+            }
+          : null,
+        createdAt: lead.created_at?.toISOString() ?? null,
+      };
+    }),
+    pagination: {
+      page: query.page,
+      limit: query.limit,
+      total,
+      totalPages: Math.max(1, Math.ceil(total / query.limit)),
+    },
+    sort: {
+      sortBy: query.sortBy,
+      sortOrder: query.sortOrder,
+    },
+    filters: {
+      search: query.search ?? "",
+      pipelineStageId: query.pipelineStageId ?? "",
+      status: query.status ?? "",
+      sourceId: query.sourceId ?? "",
+      majorId: query.majorId ?? "",
+      institutionProgramId: query.institutionProgramId ?? "",
+      assigneeId: query.assigneeId ?? "",
+      fromDate: query.fromDate ?? "",
+      toDate: query.toDate ?? "",
+    },
+  };
+}
+
+export async function getLeadFilterOptions(user: AuthUser, institutionProgramId?: string, audience?: LeadListQuery["audience"]) {
+  const scopeWhere = {
+    deleted_at: null,
+    ...getLeadScopeWhere(user, institutionProgramId),
+    AND: [studentMembershipWhere(audience)],
+    ...(institutionProgramId ? { institution_program_id: institutionProgramId } : {}),
+  };
+
+  const [sources, institutionPrograms, assignees, stages, majors, admissionStatuses, origins, stageCounts, totalLeads, failedLeads] = await prisma.$transaction([
+    prisma.lead_sources.findMany({
+      where: { leads: { some: scopeWhere } },
+      select: { id: true, name: true },
+      orderBy: { name: "asc" },
+    }),
+    prisma.institution_programs.findMany({
+      where: { leads: { some: scopeWhere } },
+      select: { id: true, name: true, institution_name: true },
+      orderBy: { name: "asc" },
+    }),
+    prisma.users.findMany({
+      where: {
+        deleted_at: null,
+        status: "active",
+        leads_leads_assigned_toTousers: { some: scopeWhere },
+      },
+      select: { id: true, full_name: true },
+      orderBy: { full_name: "asc" },
+    }),
+    prisma.pipeline_stages.findMany({
+      select: {
+        id: true,
+        name: true,
+        color: true,
+        pipeline_id: true,
+        pipelines: { select: { name: true } },
+      },
+      orderBy: [{ position: "asc" }, { id: "asc" }],
+    }),
+    prisma.majors.findMany({
+      where: {
+        OR: [
+          { leads: { some: scopeWhere } },
+          { admission_profiles: { some: { leads: { is: scopeWhere } } } },
+        ],
+      },
+      select: { id: true, name: true },
+      orderBy: { name: "asc" },
+    }),
+    prisma.admission_statuses.findMany({
+      select: { id: true, name: true },
+      orderBy: [{ name: "asc" }, { id: "asc" }],
+    }),
+    prisma.lead_origins.findMany({
+      where: { leads: { some: scopeWhere } },
+      select: { id: true, name: true },
+      orderBy: [{ name: "asc" }, { id: "asc" }],
+    }),
+    prisma.leads.groupBy({
+      by: ["pipeline_stage_id"],
+      where: { AND: [scopeWhere, { status: ACTIVE_LEAD_STATUS }] },
+      _count: { _all: true },
+    }),
+    prisma.leads.count({ where: scopeWhere }),
+    prisma.leads.count({ where: { AND: [scopeWhere, { status: { startsWith: FAILED_LEAD_STATUS_PREFIX } }] } }),
+  ]);
+  const stageCountById = new Map(
+    stageCounts.flatMap((item) => (item.pipeline_stage_id ? [[item.pipeline_stage_id, item._count._all] as const] : [])),
+  );
+
+  const customFieldDefinitions = await getLeadCustomFieldDefinitions(user, institutionProgramId ?? null, false);
+  // Nguồn options are the active values of the working program, used by "has any occurrence" filters.
+  const channels = institutionProgramId ? await listActiveLeadChannelOptions(institutionProgramId) : [];
+
+  return {
+    sources,
+    channels: channels.map((channel) => ({ id: channel.id, name: formatLeadChannelName(channel) })),
+    institutionPrograms: institutionPrograms.map((program) => ({
+      id: program.id,
+      name: program.name,
+      institutionName: program.institution_name,
+    })),
+    assignees: assignees.map((userItem) => ({
+      id: userItem.id,
+      fullName: userItem.full_name,
+    })),
+    stages: stages.map((stage) => ({
+      id: stage.id,
+      name: stage.name,
+      color: stage.color,
+      pipelineId: stage.pipeline_id,
+      pipelineName: stage.pipelines?.name ?? null,
+      count: stageCountById.get(stage.id) ?? 0,
+    })),
+    majors,
+    admissionStatuses,
+    origins,
+    totalLeads,
+    failedLeads,
+    customFields: customFieldDefinitions.fields,
+  };
+}
+
+const auditFieldLabels: Record<string, string> = {
+  fullName: "Họ và tên",
+  sourceId: "Nguồn học viên",
+  status: "Trạng thái",
+  assigneeId: "Nhân viên phụ trách",
+  departmentId: "Phòng ban",
+  pipelineStageId: "Tiến trình",
+};
+
+function describeLeadChange(action: string, newData: unknown) {
+  if (action === "create") return "Tạo Lead mới";
+  if (action === "convert_to_student") return "Chuyển sang học viên";
+  if (action === "revert_to_candidate") return "Chuyển trở lại ứng viên";
+  if (action === "source_received") return "Ghi nhận một lần phát sinh nguồn mới";
+  if (action === "assign") return "Phân công nhân viên phụ trách";
+  if (action === "reassign") return "Thay đổi nhân viên phụ trách";
+  if (action === "unassign") return "Thu hồi nhân viên phụ trách";
+  if (action === "pipeline_stage_changed") return "Thay đổi tiến trình Lead";
+  if (action === "lead_status_changed") return "Thay đổi trạng thái Lead";
+  if (action === "webhook_update") return "Webhook cập nhật dữ liệu Lead";
+  if (action === "note_created") return "Thêm ghi chú chăm sóc";
+  if (action === "file_attached") return "Đính kèm tệp vào Lead";
+  if (action === "delete") return "Xóa Lead";
+  if (action === "update" && newData && typeof newData === "object" && !Array.isArray(newData)) {
+    const fields = Object.keys(newData as Record<string, unknown>).filter((key) => key !== "executionSource").map((key) => auditFieldLabels[key] ?? key);
+    return fields.length > 0 ? `Cập nhật: ${fields.join(", ")}` : "Cập nhật thông tin Lead";
+  }
+  return "Cập nhật dữ liệu Lead";
+}
+
+export async function getLeadDetail(user: AuthUser, leadId: string, institutionProgramId?: string) {
+  const canViewSensitive = canViewSensitiveLeadData(user);
+  const lead = await prisma.leads.findFirst({
+    where: {
+      id: leadId,
+      deleted_at: null,
+      ...getLeadScopeWhere(user, institutionProgramId),
+      ...(institutionProgramId ? { institution_program_id: institutionProgramId } : {}),
+    },
+    select: {
+      students: { select: { status: true } },
+      id: true,
+      lead_code: true,
+      full_name: true,
+      phone: true,
+      secondary_phones: true,
+      email: true,
+      gender: true,
+      date_of_birth: true,
+      cccd: true,
+      note: true,
+      lead_score: true,
+      temperature: true,
+      status: true,
+      created_at: true,
+      updated_at: true,
+      major_id: true,
+      majors: { select: { id: true, name: true } },
+      institution_programs: { select: { id: true, name: true, institution_name: true } },
+      lead_sources: { select: { id: true, name: true } },
+      lead_origins: { select: { id: true, name: true } },
+      lead_source_occurrences: {
+        orderBy: [{ received_at: "desc" }, { id: "desc" }],
+        take: 100,
+        select: {
+          id: true,
+          source_name: true,
+          note: true,
+          received_at: true,
+          lead_origins: { select: { id: true, name: true } },
+          lead_channels: { select: { id: true, name: true, is_auto_created: true } },
+        },
+      },
+      pipeline_stages: { select: { id: true, name: true, color: true } },
+      users_leads_assigned_toTousers: { select: { id: true, full_name: true } },
+      users_leads_secondary_assigned_toTousers: { select: { id: true, full_name: true } },
+      users_leads_owner_idTousers: { select: { id: true, full_name: true } },
+      student_profiles: {
+        select: {
+          birth_place: true,
+          nationality: true,
+          ethnicity: true,
+          religion: true,
+          cccd_issue_date: true,
+          cccd_issue_place: true,
+          graduation_year: true,
+          graduation_certificate: true,
+          previous_graduation_certificate: true,
+          graduation_major: true,
+          graduation_rank: true,
+          diploma_issue_place: true,
+          academic_rank_12: true,
+          conduct_rank_12: true,
+          high_school_name: true,
+          high_school_province: true,
+          high_school_district: true,
+          current_job: true,
+          company_name: true,
+        },
+      },
+      addresses: {
+        select: { type: true, province: true, district: true, ward: true, hamlet: true, detail_address: true },
+      },
+      relatives: {
+        select: {
+          full_name: true,
+          relationship: true,
+          phone: true,
+          job: true,
+          is_primary: true,
+          addresses: { select: { detail_address: true } },
+        },
+      },
+      admission_profiles: {
+        select: {
+          admission_code: true,
+          expires_at: true,
+          fee_status: true,
+          tuition_status: true,
+          institution_program_id: true,
+          major_id: true,
+          admission_status_id: true,
+          training_code: true,
+          class_code: true,
+          subject_group_code: true,
+          subject_group_name: true,
+          score_1: true,
+          score_2: true,
+          score_3: true,
+          admission_score: true,
+          enrollment_batch: true,
+          registration_station: true,
+          decision_number: true,
+          decision_signed_date: true,
+          monthly_revenue: true,
+          majors: { select: { id: true, name: true } },
+          admission_statuses: { select: { id: true, name: true } },
+        },
+      },
+      utm_trackings: { select: { gclid: true }, orderBy: { created_at: "asc" }, take: 1 },
+      lead_assignments: {
+        select: {
+          id: true,
+          assigned_at: true,
+          is_main_owner: true,
+          users_lead_assignments_assigned_toTousers: { select: { id: true, full_name: true } },
+          departments: { select: { id: true, name: true } },
+        },
+        orderBy: { assigned_at: "desc" },
+        take: 20,
+      },
+      lead_status_histories: {
+        select: {
+          id: true,
+          changed_at: true,
+          pipeline_stages_lead_status_histories_from_stage_idTopipeline_stages: {
+            select: { id: true, name: true },
+          },
+          pipeline_stages_lead_status_histories_to_stage_idTopipeline_stages: {
+            select: { id: true, name: true },
+          },
+          users: { select: { id: true, full_name: true } },
+        },
+        orderBy: { changed_at: "desc" },
+        take: 20,
+      },
+      lead_notes: {
+        select: {
+          id: true,
+          content: true,
+          created_at: true,
+          users: { select: { id: true, full_name: true } },
+        },
+        orderBy: { created_at: "desc" },
+        take: 30,
+      },
+      lead_activities: {
+        select: {
+          id: true,
+          type: true,
+          metadata: true,
+          content: true,
+          created_at: true,
+          users: { select: { id: true, full_name: true } },
+        },
+        orderBy: { created_at: "desc" },
+        take: 50,
+      },
+    },
+  });
+
+  if (!lead || (isEnrolledStudent(lead.students) && !user.permissions.some((p) => ["student.view", "student.view_all"].includes(p)))) {
+    return null;
+  }
+  const creationHistory = await loadLeadCreationHistory(leadId);
+  const [creation, ...activityCreations] = await resolveLeadCreationNames([
+    creationHistory.creation,
+    ...lead.lead_activities.map((activity) => recordObject(activity.metadata).creation),
+  ], lead.institution_programs?.id ?? null);
+  const creationDisplay = describeLeadCreation(creation, canViewSensitive);
+  const webhookIds = [...new Set([creation, ...activityCreations].flatMap((item) => {
+    const id = recordObject(item).webhookId;
+    return typeof id === "string" && /^[0-9a-f]{8}-(?:[0-9a-f]{4}-){3}[0-9a-f]{12}$/i.test(id) ? [id] : [];
+  }))];
+  const webhooks = webhookIds.length && user.permissions.some((permission) => ["webhook.view", "webhook.manage"].includes(permission)) && lead.institution_programs
+    ? await prisma.webhooks.findMany({ where: { id: { in: webhookIds }, institution_program_id: lead.institution_programs.id }, select: { id: true, name: true } })
+    : [];
+  const sourceWebhook = (snapshot: unknown) => {
+    const data = recordObject(snapshot);
+    const webhook = webhooks.find((item) => item.id === data.webhookId);
+    if (!webhook) return undefined;
+    return { id: webhook.id, name: typeof data.webhookName === "string" && data.webhookName.trim() ? data.webhookName : webhook.name };
+  };
+  const failedStageId = getFailedLeadStageId(lead.status);
+  const [relatedFiles, relatedTags, recentChanges] = await prisma.$transaction([
+    prisma.file_relations.findMany({
+      where: { entity_type: "lead", entity_id: leadId, files: { is: { storage_status: "ready" } } },
+      select: {
+        id: true,
+        files: {
+          select: {
+            id: true,
+            file_name: true,
+            file_url: true,
+            storage_provider: true,
+            mime_type: true,
+            file_size: true,
+            created_at: true,
+            users: { select: { id: true, full_name: true } },
+          },
+        },
+      },
+      orderBy: { created_at: "desc" },
+      take: 30,
+    }),
+    prisma.entity_tags.findMany({
+      where: { entity_type: "lead", entity_id: leadId },
+      select: { tags: { select: { name: true } } },
+      orderBy: { created_at: "asc" },
+      take: 20,
+    }),
+    prisma.audit_logs.findMany({
+      where: { entity_type: "lead", entity_id: leadId },
+      select: {
+        id: true,
+        action: true,
+        new_data: true,
+        created_at: true,
+        users: { select: { id: true, full_name: true } },
+      },
+      orderBy: [{ created_at: "desc" }, { id: "desc" }],
+      take: 50,
+    }),
+  ]);
+  // The note shown under the stage belongs to the latest entry into the current stage only.
+  const currentStageEntry = lead.pipeline_stages
+    ? await prisma.lead_status_histories.findFirst({
+        where: { lead_id: leadId, to_stage_id: lead.pipeline_stages.id },
+        select: { note: true },
+        orderBy: { changed_at: "desc" },
+      })
+    : null;
+  const failedStage = failedStageId
+    ? await prisma.pipeline_stages.findUnique({
+        where: { id: failedStageId },
+        select: { id: true, name: true },
+      })
+    : null;
+  const profile = lead.student_profiles;
+  const specificAddress = lead.addresses.find((address) => address.type === "specific");
+  const permanentAddress = lead.addresses.find((address) => address.type === "permanent");
+  const currentAddress = lead.addresses.find((address) => address.type === "current");
+  const currentResidence = lead.addresses.find((address) => address.type === "residence");
+  const primaryRelative = lead.relatives.find((relative) => relative.is_primary);
+  const secondaryRelative = lead.relatives.find((relative) => !relative.is_primary);
+  const admission = lead.admission_profiles;
+  const unmatchedFieldValues = await listVisibleUnmatchedValues(lead.id, user, canViewSensitive);
+
+  return {
+    recordType: isEnrolledStudent(lead.students) ? "student" : "candidate",
+      id: lead.id,
+    leadCode: lead.lead_code,
+    fullName: lead.full_name,
+    phone: canViewSensitive ? lead.phone : null,
+    secondaryPhones: canViewSensitive ? lead.secondary_phones : [],
+    email: canViewSensitive ? lead.email : null,
+    gender: lead.gender,
+    dateOfBirth: lead.date_of_birth?.toISOString().slice(0, 10) ?? null,
+    cccd: canViewSensitive ? lead.cccd : null,
+    note: lead.note,
+    leadScore: lead.lead_score,
+    temperature: lead.temperature,
+    createdAt: lead.created_at?.toISOString() ?? null,
+    updatedAt: lead.updated_at?.toISOString() ?? null,
+    lifecycleStatus: toLeadLifecycleStatus(lead.status, failedStage?.name),
+    source: lead.lead_sources
+      ? { id: lead.lead_sources.id, name: lead.lead_sources.name }
+      : null,
+    origin: lead.lead_origins
+      ? { id: lead.lead_origins.id, name: lead.lead_origins.name }
+      : null,
+    sourceOccurrences: lead.lead_source_occurrences.map((occurrence) => ({
+      id: occurrence.id,
+      sourceGroup: { id: occurrence.lead_origins.id, name: occurrence.lead_origins.name },
+      // The Nguồn list value follows renames; the received name is the fallback for unlinked rows.
+      sourceName: occurrence.lead_channels
+        ? formatLeadChannelName({ name: occurrence.lead_channels.name, isAutoCreated: occurrence.lead_channels.is_auto_created })
+        : occurrence.source_name,
+      channelId: occurrence.lead_channels?.id ?? null,
+      note: occurrence.note,
+      receivedAt: occurrence.received_at.toISOString(),
+    })),
+    institutionProgram: lead.institution_programs
+      ? { id: lead.institution_programs.id, name: lead.institution_programs.name, institutionName: lead.institution_programs.institution_name }
+      : null,
+    admissionCode: admission?.admission_code ?? null,
+    admissionExpiresAt: admission?.expires_at?.toISOString().slice(0, 10) ?? null,
+    feeStatus: admission?.fee_status ?? null,
+    tuitionStatus: admission?.tuition_status ?? null,
+    pipelineStage: lead.pipeline_stages
+      ? {
+          id: lead.pipeline_stages.id,
+          name: lead.pipeline_stages.name,
+          color: lead.pipeline_stages.color,
+        }
+      : null,
+    pipelineStageNote: currentStageEntry?.note ?? null,
+    assignee: lead.users_leads_assigned_toTousers
+      ? {
+          id: lead.users_leads_assigned_toTousers.id,
+          fullName: lead.users_leads_assigned_toTousers.full_name,
+        }
+      : null,
+    secondaryAssignee: lead.users_leads_secondary_assigned_toTousers
+      ? {
+          id: lead.users_leads_secondary_assigned_toTousers.id,
+          fullName: lead.users_leads_secondary_assigned_toTousers.full_name,
+        }
+      : null,
+    owner: lead.users_leads_owner_idTousers
+      ? { id: lead.users_leads_owner_idTousers.id, fullName: lead.users_leads_owner_idTousers.full_name }
+      : null,
+    birthPlace: profile?.birth_place ?? null,
+    cccdIssueDate: canViewSensitive ? profile?.cccd_issue_date?.toISOString().slice(0, 10) ?? null : null,
+    cccdIssuePlace: canViewSensitive ? profile?.cccd_issue_place ?? null : null,
+    nationality: profile?.nationality ?? null,
+    ethnicity: profile?.ethnicity ?? null,
+    religion: profile?.religion ?? null,
+    graduationYear: profile?.graduation_year?.toString() ?? null,
+    graduationCertificate: profile?.graduation_certificate ?? null,
+    previousGraduationCertificate: profile?.previous_graduation_certificate ?? null,
+    graduationMajor: profile?.graduation_major ?? null,
+    graduationRank: profile?.graduation_rank ?? null,
+    diplomaIssuePlace: profile?.diploma_issue_place ?? null,
+    academicRank12: profile?.academic_rank_12 ?? null,
+    conductRank12: profile?.conduct_rank_12 ?? null,
+    highSchoolName: profile?.high_school_name ?? null,
+    highSchoolProvince: profile?.high_school_province ?? null,
+    highSchoolDistrict: profile?.high_school_district ?? null,
+    currentJob: profile?.current_job ?? null,
+    companyName: profile?.company_name ?? null,
+    specificAddress: canViewSensitive ? specificAddress?.detail_address ?? null : null,
+    permanentAddress: canViewSensitive ? permanentAddress?.detail_address ?? null : null,
+    currentAddress: canViewSensitive ? currentAddress?.detail_address ?? null : null,
+    currentResidence: canViewSensitive ? currentResidence?.detail_address ?? null : null,
+    province: canViewSensitive ? currentAddress?.province ?? null : null,
+    district: canViewSensitive ? currentAddress?.district ?? null : null,
+    ward: canViewSensitive ? currentAddress?.ward ?? null : null,
+    hamlet: canViewSensitive ? currentAddress?.hamlet ?? null : null,
+    relative1FullName: canViewSensitive ? primaryRelative?.full_name ?? null : null,
+    relative1Relationship: canViewSensitive ? primaryRelative?.relationship ?? null : null,
+    relative1Phone: canViewSensitive ? primaryRelative?.phone ?? null : null,
+    relative1Job: primaryRelative?.job ?? null,
+    relative1Address: canViewSensitive ? primaryRelative?.addresses?.detail_address ?? null : null,
+    relative2FullName: canViewSensitive ? secondaryRelative?.full_name ?? null : null,
+    relative2Relationship: canViewSensitive ? secondaryRelative?.relationship ?? null : null,
+    relative2Phone: canViewSensitive ? secondaryRelative?.phone ?? null : null,
+    relative2Job: secondaryRelative?.job ?? null,
+    relative2Address: canViewSensitive ? secondaryRelative?.addresses?.detail_address ?? null : null,
+    majorName: admission?.majors?.name ?? lead.majors?.name ?? null,
+    admissionStatusName: admission?.admission_statuses?.name ?? null,
+    institutionProgramId: admission?.institution_program_id ?? lead.institution_programs?.id ?? null,
+    majorId: admission?.major_id ?? lead.major_id ?? null,
+    admissionStatusId: admission?.admission_status_id ?? null,
+    trainingCode: admission?.training_code ?? null,
+    classCode: admission?.class_code ?? null,
+    subjectGroupCode: admission?.subject_group_code ?? null,
+    subjectGroupName: admission?.subject_group_name ?? null,
+    score1: admission?.score_1?.toString() ?? null,
+    score2: admission?.score_2?.toString() ?? null,
+    score3: admission?.score_3?.toString() ?? null,
+    admissionScore: admission?.admission_score?.toString() ?? null,
+    enrollmentBatch: admission?.enrollment_batch ?? null,
+    registrationStation: admission?.registration_station ?? null,
+    decisionNumber: admission?.decision_number ?? null,
+    decisionSignedDate: admission?.decision_signed_date?.toISOString().slice(0, 10) ?? null,
+    monthlyRevenue: admission?.monthly_revenue?.toISOString().slice(0, 10) ?? null,
+    gclid: lead.utm_trackings[0]?.gclid ?? null,
+    tags: relatedTags.flatMap((tag) => tag.tags ? [tag.tags.name] : []).join(", "),
+    unmatchedFieldValues,
+    assignments: lead.lead_assignments.map((assignment) => ({
+      id: assignment.id,
+      assignedAt: assignment.assigned_at?.toISOString() ?? null,
+      isMainOwner: assignment.is_main_owner ?? false,
+      assignee: assignment.users_lead_assignments_assigned_toTousers
+        ? {
+            id: assignment.users_lead_assignments_assigned_toTousers.id,
+            fullName: assignment.users_lead_assignments_assigned_toTousers.full_name,
+          }
+        : null,
+      department: assignment.departments
+        ? { id: assignment.departments.id, name: assignment.departments.name }
+        : null,
+    })),
+    stageHistory: lead.lead_status_histories.map((history) => ({
+      id: history.id,
+      changedAt: history.changed_at?.toISOString() ?? null,
+      fromStage:
+        history.pipeline_stages_lead_status_histories_from_stage_idTopipeline_stages,
+      toStage:
+        history.pipeline_stages_lead_status_histories_to_stage_idTopipeline_stages,
+      changedBy: history.users
+        ? { id: history.users.id, fullName: history.users.full_name }
+        : null,
+    })),
+    notes: lead.lead_notes.map((note) => ({
+      id: note.id,
+      content: note.content,
+      createdAt: note.created_at?.toISOString() ?? null,
+      author: note.users ? { id: note.users.id, fullName: note.users.full_name } : null,
+    })),
+    activities: lead.lead_activities.map((activity, index) => {
+      const metadata = recordObject(activity.metadata);
+      const isCreation = activity.type === "lead_created" || Boolean(recordObject(metadata.creation).channel) ||
+        (activity.type === "marketing_form_submitted" && activity.content?.startsWith("Lead được tạo"));
+      const display = recordObject(metadata.creation).channel ? describeLeadCreation(activityCreations[index], canViewSensitive) : creationDisplay;
+      return {
+        id: activity.id,
+        type: activity.type,
+        content: isCreation ? display.description : activity.content,
+        sourceWebhook: isCreation ? sourceWebhook(recordObject(metadata.creation).channel ? activityCreations[index] : creation) : undefined,
+        createdAt: activity.created_at?.toISOString() ?? null,
+        actorLabel: leadHistoryActorLabel(activity.type, activity.metadata, activity.content) ?? (isCreation ? display.actorLabel : undefined),
+        actor: isCreation && display.automated ? null : activity.users ? { id: activity.users.id, fullName: activity.users.full_name } : null,
+      };
+    }),
+    recentChanges: recentChanges.map((change) => ({
+      id: change.id,
+      action: change.action,
+      sourceWebhook: leadCreationActions.includes(change.action) ? sourceWebhook(creation) : undefined,
+      description: leadCreationActions.includes(change.action) ? creationDisplay.description : describeLeadChange(change.action, change.new_data),
+      actorLabel: leadHistoryActorLabel(change.action, change.new_data) ?? (leadCreationActions.includes(change.action) ? creationDisplay.actorLabel : undefined),
+      createdAt: change.created_at?.toISOString() ?? null,
+      actor: leadCreationActions.includes(change.action) && creationDisplay.automated ? null : change.users ? { id: change.users.id, fullName: change.users.full_name } : null,
+    })),
+    files: relatedFiles.flatMap((relation) =>
+      relation.files
+        ? [{
+            id: relation.files.id,
+            fileName: relation.files.file_name,
+            fileUrl: relation.files.file_url,
+            storageKind: relation.files.storage_provider,
+            canDownload: relation.files.storage_provider === "s3",
+            mimeType: relation.files.mime_type,
+            fileSize: relation.files.file_size?.toString() ?? null,
+            createdAt: relation.files.created_at?.toISOString() ?? null,
+            uploadedBy: relation.files.users
+              ? { id: relation.files.users.id, fullName: relation.files.users.full_name }
+              : null,
+          }]
+        : [],
+    ),
+  };
+}

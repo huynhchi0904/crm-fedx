@@ -1,0 +1,34 @@
+{
+  "name": "@admission-crm/shared",
+  "private": true,
+  "type": "module",
+  "exports": {
+    "./postgres-config": "./src/postgres-config.ts",
+    "./releases": "./src/releases.ts",
+    "./system-preferences": "./src/system-preferences.ts",
+    "./source-group": "./src/source-group.ts",
+    "./sale-work-schedule": "./src/sale-work-schedule.ts",
+    "./vietnam-provinces": "./src/vietnam-provinces.ts",
+    "./automation-information-update": "./src/automation-information-update.ts",
+    "./marketing-form-layout": "./src/marketing-form-layout.ts",
+    "./marketing-form-visibility": "./src/marketing-form-visibility.ts",
+    "./marketing-form-submission-policy": "./src/marketing-form-submission-policy.ts",
+    "./marketing-form-snapshot": "./src/marketing-form-snapshot.ts",
+    "./marketing-form-config": "./src/marketing-form-config.ts",
+    "./marketing-form-embed": "./src/marketing-form-embed.ts",
+    "./automation-assignment": "./src/automation-assignment.ts",
+    "./automation-reassignment-policy": "./src/automation-reassignment-policy.ts",
+    "./lead-form-field-catalog": "./src/lead-form-field-catalog.ts",
+    "./lead-field-groups": "./src/lead-field-groups.ts",
+    "./marketing-form-lead-fields": "./src/marketing-form-lead-fields.ts",
+    "./display-layout": "./src/display-layout.ts",
+    "./access-scope": "./src/access-scope.ts",
+    "./lead-phone": "./src/lead-phone.ts",
+    "./lead-source": "./src/lead-source.ts",
+    "./lead-channel": "./src/lead-channel.ts",
+    "./password-policy": "./src/password-policy.ts"
+  },
+  "dependencies": {
+    "zod": "4.4.3"
+  }
+}

@@ -1,0 +1,474 @@
+export type LeadListItem = {
+  recordType: "candidate" | "student";
+  lifecycleStatus: {
+    value: "ACTIVE" | "FAIL";
+    label: string;
+    failedStageId: string | null;
+  };
+  id: string;
+  leadCode: string | null;
+  fullName: string;
+  phone: string | null;
+  secondaryPhones: string[];
+  email: string | null;
+  gender: string | null;
+  dateOfBirth: string | null;
+  birthPlace: string | null;
+  cccd: string | null;
+  cccdIssueDate: string | null;
+  cccdIssuePlace: string | null;
+  nationality: string | null;
+  ethnicity: string | null;
+  religion: string | null;
+  specificAddress: string | null;
+  graduationYear: string | null;
+  graduationCertificate: string | null;
+  previousGraduationCertificate: string | null;
+  graduationMajor: string | null;
+  graduationRank: string | null;
+  diplomaIssuePlace: string | null;
+  academicRank12: string | null;
+  conductRank12: string | null;
+  highSchoolName: string | null;
+  highSchoolProvince: string | null;
+  highSchoolDistrict: string | null;
+  province: string | null;
+  district: string | null;
+  ward: string | null;
+  hamlet: string | null;
+  currentAddress: string | null;
+  permanentAddress: string | null;
+  currentResidence: string | null;
+  currentJob: string | null;
+  companyName: string | null;
+  relative1FullName: string | null;
+  relative1Relationship: string | null;
+  relative1Phone: string | null;
+  relative1Job: string | null;
+  relative1Address: string | null;
+  relative2FullName: string | null;
+  relative2Relationship: string | null;
+  relative2Phone: string | null;
+  relative2Job: string | null;
+  relative2Address: string | null;
+  majorName: string | null;
+  institutionProgram: { id: string; name: string; institutionName: string } | null;
+  admissionStatusName: string | null;
+  trainingCode: string | null;
+  classCode: string | null;
+  subjectGroupCode: string | null;
+  subjectGroupName: string | null;
+  score1: string | null;
+  score2: string | null;
+  score3: string | null;
+  admissionScore: string | null;
+  enrollmentBatch: string | null;
+  registrationStation: string | null;
+  decisionNumber: string | null;
+  decisionSignedDate: string | null;
+  monthlyRevenue: string | null;
+  gclid: string | null;
+  tags: string;
+  note: string | null;
+  latestNote?: string | null;
+  temperature: string | null;
+  source: { id: string; name: string } | null;
+  origin: { id: string; name: string } | null;
+  pipelineStage: { id: string; name: string; color: string | null } | null;
+  assignee: { id: string; fullName: string } | null;
+  secondaryAssignee?: { id: string; fullName: string } | null;
+  createdAt: string | null;
+};
+
+export type LeadSortField = "createdAt" | "fullName" | "leadCode" | "pipelineStage";
+
+export type LeadListFilters = {
+  status?: "" | "ACTIVE" | "FAIL";
+  search: string;
+  pipelineStageId: string;
+  sourceId: string;
+  majorId: string;
+  assigneeId: string;
+  fromDate: string;
+  toDate: string;
+};
+
+export type LeadListResponse = {
+  data: LeadListItem[];
+  pagination: {
+    page: number;
+    limit: number;
+    total: number;
+    totalPages: number;
+  };
+  sort: {
+    sortBy: LeadSortField;
+    sortOrder: "asc" | "desc";
+  };
+  filters: LeadListFilters;
+};
+
+export type LeadFilterOptions = {
+  sources: Array<{ id: string; name: string }>;
+  institutionPrograms: Array<{ id: string; name: string; institutionName: string }>;
+  assignees: Array<{ id: string; fullName: string }>;
+  stages: Array<{
+    id: string;
+    name: string;
+    color: string | null;
+    pipelineId: string | null;
+    pipelineName: string | null;
+    count: number;
+  }>;
+  majors: Array<{ id: string; name: string }>;
+  admissionStatuses?: Array<{ id: string; name: string }>;
+  /** Nhóm nguồn of the working program. */
+  origins?: Array<{ id: string; name: string }>;
+  /** Active Nguồn values of the working program (names of auto-created values end with "*"). */
+  channels?: Array<{ id: string; name: string }>;
+  totalLeads: number;
+  failedLeads: number;
+  customFields?: LeadCustomField[];
+};
+
+export type DuplicateLeadField = "fullName" | "phone" | "email";
+
+export type DuplicateLeadResponse = {
+  data: Array<{
+    key: string;
+    count: number;
+    leads: Array<{
+      id: string;
+      leadCode: string | null;
+      fullName: string;
+      phone: string | null;
+      email: string | null;
+      createdAt: string | null;
+    }>;
+  }>;
+  pagination: { page: number; limit: number; total: number; totalPages: number };
+};
+
+/** Raw webhook value that did not match CRM data; shown with "*" until a user saves a valid value. */
+export type LeadUnmatchedFieldValue = {
+  /** Lead field key (`majorId`) or `custom:<fieldId>`. */
+  fieldKey: string;
+  label: string;
+  rawValue: string;
+  receivedAt: string;
+};
+
+export type LeadDetail = LeadListItem & {
+  unmatchedFieldValues?: LeadUnmatchedFieldValue[];
+  /** Note chosen when the lead last entered its current pipeline stage. */
+  pipelineStageNote?: string | null;
+  sourceOccurrences: Array<{
+    id: string;
+    sourceGroup: { id: string; name: string };
+    sourceName: string;
+    note: string | null;
+    receivedAt: string;
+  }>;
+  phone: string | null;
+  email: string | null;
+  gender: string | null;
+  dateOfBirth: string | null;
+  cccd: string | null;
+  note: string | null;
+  leadScore: number | null;
+  temperature: string | null;
+  updatedAt: string | null;
+  birthPlace: string | null;
+  cccdIssueDate: string | null;
+  cccdIssuePlace: string | null;
+  nationality: string | null;
+  ethnicity: string | null;
+  religion: string | null;
+  graduationYear: string | null;
+  graduationCertificate: string | null;
+  previousGraduationCertificate: string | null;
+  graduationMajor: string | null;
+  graduationRank: string | null;
+  diplomaIssuePlace: string | null;
+  academicRank12: string | null;
+  conductRank12: string | null;
+  highSchoolName: string | null;
+  highSchoolProvince: string | null;
+  highSchoolDistrict: string | null;
+  currentJob: string | null;
+  companyName: string | null;
+  specificAddress: string | null;
+  permanentAddress: string | null;
+  currentAddress: string | null;
+  currentResidence: string | null;
+  province: string | null;
+  district: string | null;
+  ward: string | null;
+  hamlet: string | null;
+  relative1FullName: string | null;
+  relative1Relationship: string | null;
+  relative1Phone: string | null;
+  relative1Job: string | null;
+  relative1Address: string | null;
+  relative2FullName: string | null;
+  relative2Relationship: string | null;
+  relative2Phone: string | null;
+  relative2Job: string | null;
+  relative2Address: string | null;
+  institutionProgramId: string | null;
+  majorId: string | null;
+  admissionStatusId: string | null;
+  trainingCode: string | null;
+  classCode: string | null;
+  subjectGroupCode: string | null;
+  subjectGroupName: string | null;
+  score1: string | null;
+  score2: string | null;
+  score3: string | null;
+  admissionScore: string | null;
+  enrollmentBatch: string | null;
+  registrationStation: string | null;
+  decisionNumber: string | null;
+  decisionSignedDate: string | null;
+  monthlyRevenue: string | null;
+  gclid: string | null;
+  tags: string;
+  owner: { id: string; fullName: string } | null;
+  assignments: Array<{
+    id: string;
+    assignedAt: string | null;
+    isMainOwner: boolean;
+    assignee: { id: string; fullName: string } | null;
+    department: { id: string; name: string } | null;
+  }>;
+  stageHistory: Array<{
+    id: string;
+    changedAt: string | null;
+    fromStage: { id: string; name: string } | null;
+    toStage: { id: string; name: string } | null;
+    changedBy: { id: string; fullName: string } | null;
+  }>;
+  notes: Array<{
+    id: string;
+    content: string;
+    createdAt: string | null;
+    author: { id: string; fullName: string } | null;
+  }>;
+  activities: Array<{
+    id: string;
+    type: string;
+    content: string | null;
+    sourceWebhook?: { id: string; name: string };
+    createdAt: string | null;
+    actorLabel?: string;
+    actor: { id: string; fullName: string } | null;
+  }>;
+  recentChanges: Array<{
+    id: string;
+    action: string;
+    description: string;
+    sourceWebhook?: { id: string; name: string };
+    createdAt: string | null;
+    actorLabel?: string;
+    actor: { id: string; fullName: string } | null;
+  }>;
+  files: Array<{
+    id: string;
+    fileName: string;
+    fileUrl: string | null;
+    storageKind?: string;
+    canDownload?: boolean;
+    mimeType: string | null;
+    fileSize: string | null;
+    createdAt: string | null;
+    uploadedBy: { id: string; fullName: string } | null;
+  }>;
+};
+
+export type LeadFormInput = {
+  fullName: string;
+  phone: string;
+  secondaryPhones?: string[];
+  sourceId: string;
+  assigneeId: string;
+  secondaryAssigneeId?: string;
+  pipelineStageId: string;
+  noteTemplateId?: string;
+  noteContent?: string;
+  email: string;
+  gender: string;
+  dateOfBirth: string;
+  cccd: string;
+  note: string;
+  temperature: string;
+  birthPlace: string;
+  cccdIssueDate: string;
+  cccdIssuePlace: string;
+  nationality: string;
+  ethnicity: string;
+  religion: string;
+  graduationYear: string;
+  graduationCertificate: string;
+  previousGraduationCertificate: string;
+  graduationMajor: string;
+  graduationRank: string;
+  diplomaIssuePlace: string;
+  academicRank12: string;
+  conductRank12: string;
+  highSchoolName: string;
+  highSchoolProvince: string;
+  highSchoolDistrict: string;
+  currentJob: string;
+  companyName: string;
+  specificAddress: string;
+  permanentAddress: string;
+  currentAddress: string;
+  currentResidence: string;
+  province: string;
+  district: string;
+  ward: string;
+  hamlet: string;
+  relative1FullName: string;
+  relative1Relationship: string;
+  relative1Phone: string;
+  relative1Job: string;
+  relative1Address: string;
+  relative2FullName: string;
+  relative2Relationship: string;
+  relative2Phone: string;
+  relative2Job: string;
+  relative2Address: string;
+  institutionProgramId: string;
+  majorId: string;
+  admissionStatusId: string;
+  trainingCode: string;
+  classCode: string;
+  subjectGroupCode: string;
+  subjectGroupName: string;
+  score1: string;
+  score2: string;
+  score3: string;
+  admissionScore: string;
+  enrollmentBatch: string;
+  registrationStation: string;
+  decisionNumber: string;
+  decisionSignedDate: string;
+  monthlyRevenue: string;
+  gclid: string;
+  tags: string;
+  customFieldValues: Record<string, LeadCustomFieldValue>;
+};
+
+export type LeadActionOptions = {
+  manualAssignment?: { defaultAssigneeId: string | null; keepUnassigned: boolean; automationEnabled: boolean };
+  sources: Array<{ id: string; name: string }>;
+  stages: Array<{ id: string; name: string; color: string | null; pipelineId: string | null; pipelineName: string | null }>;
+  assignees: Array<{ id: string; fullName: string }>;
+  telesales: Array<{ id: string; fullName: string }>;
+  departments: Array<{ id: string; name: string }>;
+  institutionPrograms: Array<{ id: string; name: string; code: string; institutionName: string }>;
+  majors: Array<{ id: string; name: string; code: string | null }>;
+  admissionStatuses: Array<{ id: string; name: string }>;
+  tags: string[];
+  systemFieldRequirements: Record<string, boolean>;
+};
+
+export type LeadBulkUpdateField = "pipelineStageId" | "sourceId" | "originId" | "monthlyRevenue" | "note";
+
+export type LeadBulkUpdateFieldOption = {
+  options: Array<{ id: string; name: string }>;
+  readOnlyReason: string | null;
+};
+
+export type LeadBulkUpdateOptions = Record<"sourceId" | "originId" | "monthlyRevenue", LeadBulkUpdateFieldOption>;
+
+export type LeadBulkUpdateResult = {
+  field: LeadBulkUpdateField;
+  totalCount: number;
+  updatedCount: number;
+  unchangedCount: number;
+  failedCount: number;
+  failures: Array<{ leadId: string; fullName: string; leadCode: string | null; message: string }>;
+};
+
+export type LeadImportError = {
+  row: number;
+  fullName: string | null;
+  phone: string | null;
+  message: string;
+};
+
+export type LeadImportResult = {
+  preview?: boolean;
+  totalRows: number;
+  importedRows: number;
+  updatedRows: number;
+  unchangedRows: number;
+  failedRows: number;
+  errors: LeadImportError[];
+};
+
+export type LeadCustomFieldDataType =
+  | "TEXT"
+  | "TEXTAREA"
+  | "NUMBER"
+  | "DATE"
+  | "DATETIME"
+  | "BOOLEAN"
+  | "SELECT"
+  | "MULTI_SELECT"
+  | "EMAIL"
+  | "PHONE"
+  | "PROVINCE"
+  | "FILE";
+
+export type LeadCustomFieldFileValue = {
+  name: string;
+  size: number;
+  type: string;
+  lastModified: number;
+  dataUrl?: string;
+  url?: string;
+};
+
+export type LeadCustomFieldValue = string | number | boolean | string[] | LeadCustomFieldFileValue | LeadCustomFieldFileValue[] | null;
+
+export type LeadCustomFieldOption = {
+  code: string;
+  label: string;
+  isActive: boolean;
+  displayOrder: number;
+};
+
+export type LeadCustomField = {
+  id: string;
+  code: string;
+  name: string;
+  description: string | null;
+  group: {
+    id: string;
+    key: string;
+    label: string;
+    description: string | null;
+    isSystem: boolean;
+    displayOrder: number;
+  };
+  dataType: LeadCustomFieldDataType;
+  isRequired: boolean;
+  isSensitive: boolean;
+  displayOrder: number;
+  options: LeadCustomFieldOption[] | null;
+  validationRules: Record<string, unknown> | null;
+  defaultValue?: LeadCustomFieldValue;
+  value: LeadCustomFieldValue;
+  canView: boolean;
+  canEdit: boolean;
+};
+
+export type LeadCustomFieldsResponse = {
+  fields: LeadCustomField[];
+};
+
+export type LeadCustomFieldUpdateInput = {
+  values: Array<{ fieldId: string; value: LeadCustomFieldValue }>;
+};

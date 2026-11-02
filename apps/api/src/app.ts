@@ -1,0 +1,138 @@
+import cors from "cors";
+import { releasesRouter } from "./modules/releases/releases.router";
+import { prisma } from "./database/prisma";
+import { redisCommandConnection, redisFeatures } from "./config/redis";
+import { checkReadiness } from "./modules/operations/readiness";
+import { operationsRouter } from "./modules/operations/operations.router";
+import { saleWorkSchedulesRouter } from "./modules/sale-work-schedules/sale-work-schedule.router";
+import { displayLayoutsRouter } from "./modules/display-layouts/display-layout.router";
+import express, { type ErrorRequestHandler } from "express";
+import { LeadRequiredFieldsError } from "./modules/leads/lead-required-fields";
+import path from "node:path";
+
+import { env } from "./config/env";
+import { releaseCommit } from "./config/release-commit";
+import { authRouter } from "./modules/auth/auth.router";
+import { privateFilesRouter } from "./modules/files/private-files.router";
+import { admissionsRouter } from "./modules/admissions/admissions.router";
+import { majorsRouter } from "./modules/admissions/majors.router";
+import { auditLogsRouter } from "./modules/audit/audit-logs.router";
+import { campaignsRouter } from "./modules/campaigns/campaigns.router";
+import { customerListsRouter } from "./modules/customer-lists/customer-lists.router";
+import { formFieldsRouter, formsRouter } from "./modules/campaigns/forms.router";
+import { leadChannelsRouter } from "./modules/campaigns/lead-channel.router";
+import { MarketingFormConfigError } from "./modules/campaigns/marketing-form-config.validation";
+import {
+  leadSourcesRouter,
+  marketingFormsRouter,
+  publicMarketingFormsRouter,
+  utmTrackingsRouter,
+} from "./modules/campaigns/marketing-reference.router";
+import { dashboardRouter } from "./modules/dashboard/dashboard.router";
+import { departmentsRouter } from "./modules/departments/departments.router";
+import { institutionProgramsRouter } from "./modules/institutions/institution-programs.router";
+import { InstitutionProgramScopeError } from "./modules/institutions/institution-program-scope";
+import { leadsRouter } from "./modules/leads/leads.router";
+import { saleOverviewRouter } from "./modules/leads/sale-overview.router";
+import { personalNotificationsRouter } from "./modules/notifications/personal-notifications.router";
+import { permissionsRouter } from "./modules/permissions/permissions.router";
+import { pipelinesRouter } from "./modules/pipelines/pipelines.router";
+import { reportsRouter } from "./modules/reports/reports.router";
+import { rolesRouter } from "./modules/roles/roles.router";
+import { studentsRouter } from "./modules/students/students.router";
+import { systemRouter } from "./modules/system/system.router";
+import { automationsRouter } from "./modules/automations/automations.router";
+import { usersRouter } from "./modules/users/users.router";
+import { customFieldsRouter } from "./modules/custom-fields/custom-fields.router";
+import { publicWebhookRouter, webhooksAdminRouter } from "./modules/webhooks/webhooks.router";
+import { zaloRouter } from "./modules/integrations/zalo/zalo.router";
+import { metaRouter } from "./modules/integrations/meta/meta.router";
+import { tiktokRouter } from "./modules/integrations/tiktok/tiktok.router";
+
+export const app = express();
+app.set("trust proxy", env.AUTH_TRUSTED_PROXY_CIDRS.length ? env.AUTH_TRUSTED_PROXY_CIDRS : false);
+const publicDirectory = path.resolve(__dirname, "../public");
+
+app.disable("x-powered-by");
+app.use(cors({ origin: env.WEB_ORIGIN, credentials: true }));
+app.use("/api/webhooks", publicWebhookRouter);
+app.use(express.static(publicDirectory, {
+  dotfiles: "ignore",
+  fallthrough: true,
+  index: false,
+}));
+app.use(express.json({
+  limit: "1mb",
+  verify: (request, _response, buffer) => {
+    (request as typeof request & { rawBody?: string }).rawBody = buffer.toString("utf8");
+  },
+}));
+
+app.get("/api/health", (_request, response) => {
+  response.json({ status: "ok" });
+});
+
+app.get("/api/ready", async (_request, response) => {
+  response.setHeader("Cache-Control", "no-store");
+  const ready = await checkReadiness({ database: () => prisma.$queryRaw`SELECT 1`, redis: redisCommandConnection ? redisCommandConnection.ping.bind(redisCommandConnection) : null, features: redisFeatures });
+  if (ready) response.json({ status: "ok", commit: releaseCommit() });
+  else response.status(503).json({ status: "unavailable" });
+});
+
+app.use("/api/system/operations", operationsRouter);
+
+app.use("/api/system/releases", releasesRouter);
+
+app.use("/api/auth", authRouter);
+app.use("/api", privateFilesRouter);
+app.use("/api/admissions", admissionsRouter);
+app.use("/api/majors", majorsRouter);
+app.use("/api/audit-logs", auditLogsRouter);
+app.use("/api/campaigns", campaignsRouter);
+app.use("/api/customer-lists", customerListsRouter);
+app.use("/api/forms", formsRouter);
+app.use("/api/form-fields", formFieldsRouter);
+app.use("/api/lead-sources", leadSourcesRouter);
+app.use("/api/lead-channels", leadChannelsRouter);
+app.use("/api/marketing-forms", marketingFormsRouter);
+app.use("/api/public", publicMarketingFormsRouter);
+app.use("/api/dashboard", dashboardRouter);
+app.use("/api/departments", departmentsRouter);
+app.use("/api/institution-programs", institutionProgramsRouter);
+app.use("/api/leads", leadsRouter);
+app.use("/api/reports", reportsRouter);
+app.use("/api/roles", rolesRouter);
+app.use("/api/sale", saleOverviewRouter);
+app.use("/api/notifications", personalNotificationsRouter);
+app.use("/api/permissions", permissionsRouter);
+app.use("/api/pipelines", pipelinesRouter);
+app.use("/api/students", studentsRouter);
+app.use("/api/system", systemRouter);
+app.use("/api/display-layouts", displayLayoutsRouter);
+app.use("/api/automations", automationsRouter);
+app.use("/api/sale-work-schedules", saleWorkSchedulesRouter);
+app.use("/api/utm-trackings", utmTrackingsRouter);
+app.use("/api/users", usersRouter);
+app.use("/api/custom-fields", customFieldsRouter);
+app.use("/api/settings/webhooks", webhooksAdminRouter);
+app.use("/api/integrations/zalo", zaloRouter);
+app.use("/api/integrations/meta", metaRouter);
+app.use("/api/integrations/tiktok", tiktokRouter);
+
+const errorHandler: ErrorRequestHandler = (error, _request, response, _next) => {
+  if (error instanceof LeadRequiredFieldsError) { response.status(400).json({ message: error.message }); return; }
+  if (error instanceof MarketingFormConfigError) {
+    response.status(400).json({ message: error.message, issues: error.issues });
+    return;
+  }
+  if (error instanceof InstitutionProgramScopeError) {
+    response.status(error.statusCode).json({ message: error.message });
+    return;
+  }
+  console.error(error);
+  response.status(500).json({
+    message: "Đã xảy ra lỗi máy chủ. Vui lòng thử lại.",
+  });
+};
+
+app.use(errorHandler);

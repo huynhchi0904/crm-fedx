@@ -1,0 +1,913 @@
+import { Router } from "express";
+import { z } from "zod";
+import { automationBulkFilterSchema } from "./automation-bulk-filter";
+import { LeadFilterError } from "../leads/lead-filter.service";
+
+import { requireAnyPermission, requireAuthentication } from "../../middlewares/auth.middleware";
+import { leadListPermissions } from "../leads/lead-list.service";
+import { leadUpdatePermissions } from "../leads/lead-owner-stage-mutations.service";
+import {
+  createAutomationRule,
+  duplicateAutomationRule,
+  archiveAutomationRule,
+  getAutomationOptions,
+  getAutomationExecution,
+  getAutomationBulkRun,
+  getAutomationRule,
+  listAutomationRules,
+  listExecutionLogs,
+  listAutomationTestLeads,
+  runAutomationTest,
+  previewAutomationBulkRun,
+  startAutomationBulkRun,
+  toggleAutomationRule,
+  updateAutomationRule,
+  validateAutomationRule,
+} from "./automation.service";
+import { AUTOMATION_TRIGGER_TYPES } from "./automation-registry";
+import { createAutomationWebhookEndpoint } from "./automation-webhook.service";
+import { setAutomationContactPreference, suppressAutomationDestination } from "./automation-message-delivery.service";
+import {
+  getAutomationExecutionForOperations,
+  getAutomationOperationalMetrics,
+  listAutomationExecutions,
+  listAutomationOwnerCandidates,
+  listAutomationTransferRules,
+  listAutomationRuleVersions,
+  replayAutomationExecution,
+  retryAutomationExecution,
+  rollbackAutomationRule,
+  transferAutomationRuleOwner,
+} from "./automation-observability.service";
+
+export const automationsRouter = Router();
+
+automationsRouter.use(requireAuthentication);
+
+const listQuerySchema = z.object({
+  page: z.coerce.number().int().min(1).default(1),
+  limit: z.coerce.number().int().min(1).max(100).default(20),
+  search: z.string().trim().max(100).optional().transform((v) => v || undefined),
+  isActive: z
+    .string()
+    .optional()
+    .transform((v) => (v === "true" ? true : v === "false" ? false : undefined)),
+  triggerType: z.string().trim().max(100).optional().transform((v) => v || undefined),
+  institutionProgramId: z.string().uuid().optional().or(z.literal("")).transform((v) => v || undefined),
+});
+
+const optionsQuerySchema = z.object({
+  institutionProgramId: z.string().uuid().optional().or(z.literal("")).transform((value) => value || undefined),
+});
+
+const createSchema = z.object({
+  name: z.string().trim().min(2).max(255),
+  description: z.string().trim().max(1000).optional().transform((v) => v || undefined),
+  triggerType: z.enum(AUTOMATION_TRIGGER_TYPES),
+  graphData: z.record(z.string(), z.unknown()).default({ nodes: [], edges: [] }),
+  institutionProgramId: z.string().uuid().optional().or(z.literal("")).transform((v) => v || undefined),
+});
+
+const updateSchema = z.object({
+  name: z.string().trim().min(2).max(255).optional(),
+  description: z.string().trim().max(1000).optional(),
+  triggerType: z.enum(AUTOMATION_TRIGGER_TYPES).optional(),
+  graphData: z.record(z.string(), z.unknown()).optional(),
+  institutionProgramId: z.string().uuid().optional().or(z.literal("")).transform((v) => v || undefined),
+});
+
+const toggleSchema = z.object({
+  isActive: z.boolean(),
+});
+
+const logQuerySchema = z.object({
+  page: z.coerce.number().int().min(1).default(1),
+  limit: z.coerce.number().int().min(1).max(100).default(20),
+});
+
+const observabilityQuerySchema = z.object({
+  page: z.coerce.number().int().min(1).default(1),
+  limit: z.coerce.number().int().min(1).max(100).default(20),
+  search: z.string().trim().max(100).optional().transform((value) => value || undefined),
+  ruleId: z.string().uuid().optional(),
+  status: z.enum(["processing", "completed", "failed", "stuck"]).optional(),
+  source: z.string().trim().max(50).optional().transform((value) => value || undefined),
+  from: z.coerce.date().optional(),
+  to: z.coerce.date().optional(),
+});
+
+const metricsQuerySchema = z.object({
+  from: z.coerce.date().optional(),
+  to: z.coerce.date().optional(),
+});
+
+const transferOwnerSchema = z.object({ ownerId: z.string().uuid() });
+const replaySchema = z.object({ requestId: z.string().uuid() });
+const ownerCandidatesQuerySchema = z.object({
+  search: z.string().trim().min(2).max(100),
+});
+const transferRulesQuerySchema = z.object({
+  search: z.string().trim().max(100).optional().transform((value) => value || undefined),
+});
+
+const testLeadQuerySchema = z.object({
+  page: z.coerce.number().int().min(1).default(1),
+  limit: z.coerce.number().int().min(1).max(50).default(20),
+  search: z.string().trim().max(100).optional().transform((value) => value || undefined),
+});
+
+const testRunSchema = z.object({
+  leadId: z.string().uuid(),
+});
+
+const bulkRunSchema = automationBulkFilterSchema;
+
+const entityIdSchema = z.string().uuid();
+
+const webhookEndpointSchema = z.object({
+  name: z.string().trim().min(2).max(255),
+  url: z.string().url().max(2048),
+  secret: z.string().min(16).max(512),
+  allowedHosts: z.array(z.string().trim().min(1).max(253)).min(1).max(20),
+  institutionProgramId: z.string().uuid().optional(),
+});
+
+const contactPreferenceSchema = z.object({
+  leadId: z.string().uuid(),
+  channel: z.enum(["email", "sms", "zns"]),
+  status: z.enum(["consented", "opted_out", "unknown"]),
+  source: z.string().trim().max(100).optional(),
+});
+
+const suppressionSchema = z.object({
+  channel: z.enum(["email", "sms", "zns"]),
+  destination: z.string().trim().min(3).max(255),
+  reason: z.string().trim().max(255).optional(),
+  institutionProgramId: z.string().uuid().optional(),
+});
+
+// GET /api/automations
+automationsRouter.get(
+  "/",
+  requireAnyPermission("automation.manage"),
+  async (request, response, next) => {
+    try {
+      const parsed = listQuerySchema.safeParse(request.query);
+      if (!parsed.success) {
+        response.status(400).json({ message: "Tham số danh sách automation không hợp lệ." });
+        return;
+      }
+      const result = await listAutomationRules(request.authUser!, parsed.data);
+      if (!result) {
+        response.status(404).json({ message: "Không tìm thấy chương trình tuyển sinh trong phạm vi truy cập." });
+        return;
+      }
+      response.json(result);
+    } catch (error) {
+      next(error);
+    }
+  },
+);
+
+// GET /api/automations/options
+automationsRouter.get(
+  "/options",
+  requireAnyPermission("automation.manage"),
+  async (request, response, next) => {
+    try {
+      const parsed = optionsQuerySchema.safeParse(request.query);
+      if (!parsed.success) {
+        response.status(400).json({ message: "Chương trình tuyển sinh không hợp lệ." });
+        return;
+      }
+      const result = await getAutomationOptions(request.authUser!, parsed.data.institutionProgramId);
+      if (!result) {
+        response.status(404).json({ message: "Không tìm thấy chương trình tuyển sinh trong phạm vi truy cập." });
+        return;
+      }
+      response.json(result);
+    } catch (error) {
+      next(error);
+    }
+  },
+);
+
+// POST /api/automations/webhook-endpoints
+automationsRouter.post(
+  "/webhook-endpoints",
+  requireAnyPermission("automation.manage"),
+  async (request, response, next) => {
+    try {
+      const parsed = webhookEndpointSchema.safeParse(request.body);
+      if (!parsed.success) {
+        response.status(400).json({ message: "Cấu hình webhook endpoint không hợp lệ." });
+        return;
+      }
+      const result = await createAutomationWebhookEndpoint(request.authUser!, parsed.data);
+      if (!result) {
+        response.status(403).json({ message: "Bạn không có quyền tạo webhook endpoint trong phạm vi này." });
+        return;
+      }
+      if (!result.ok) {
+        response.status(422).json({ message: `Đích webhook không an toàn: ${result.reason}.` });
+        return;
+      }
+      response.status(201).json(result.data);
+    } catch (error) {
+      next(error);
+    }
+  },
+);
+
+automationsRouter.put(
+  "/contact-preferences",
+  requireAnyPermission("automation.manage"),
+  requireAnyPermission("lead.sensitive.view"),
+  requireAnyPermission(...leadUpdatePermissions),
+  async (request, response, next) => {
+    try {
+      const parsed = contactPreferenceSchema.safeParse(request.body);
+      if (!parsed.success) {
+        response.status(400).json({ message: "Trạng thái đồng ý nhận tin không hợp lệ." });
+        return;
+      }
+      const result = await setAutomationContactPreference(request.authUser!, parsed.data);
+      if (!result) {
+        response.status(404).json({ message: "Không tìm thấy Lead trong phạm vi truy cập." });
+        return;
+      }
+      response.json(result);
+    } catch (error) {
+      next(error);
+    }
+  },
+);
+
+automationsRouter.post(
+  "/suppressions",
+  requireAnyPermission("automation.manage"),
+  requireAnyPermission("lead.sensitive.view"),
+  requireAnyPermission(...leadUpdatePermissions),
+  async (request, response, next) => {
+    try {
+      const parsed = suppressionSchema.safeParse(request.body);
+      if (!parsed.success) {
+        response.status(400).json({ message: "Thông tin chặn gửi không hợp lệ." });
+        return;
+      }
+      const result = await suppressAutomationDestination(request.authUser!, parsed.data);
+      if (!result) {
+        response.status(403).json({ message: "Bạn không có quyền quản lý suppression trong phạm vi này." });
+        return;
+      }
+      response.status(201).json(result);
+    } catch (error) {
+      next(error);
+    }
+  },
+);
+
+// GET /api/automations/observability/executions
+automationsRouter.get(
+  "/observability/executions",
+  requireAnyPermission("automation.manage", "automation.view_logs"),
+  async (request, response, next) => {
+    try {
+      const parsed = observabilityQuerySchema.safeParse(request.query);
+      if (!parsed.success) {
+        response.status(400).json({ message: "Bộ lọc lịch sử thực thi không hợp lệ." });
+        return;
+      }
+      response.json(await listAutomationExecutions(request.authUser!, parsed.data));
+    } catch (error) {
+      next(error);
+    }
+  },
+);
+
+// GET /api/automations/observability/executions/:executionId
+automationsRouter.get(
+  "/observability/executions/:executionId",
+  requireAnyPermission("automation.manage", "automation.view_logs"),
+  async (request, response, next) => {
+    try {
+      const parsedId = entityIdSchema.safeParse(request.params.executionId);
+      if (!parsedId.success) {
+        response.status(400).json({ message: "Mã execution không hợp lệ." });
+        return;
+      }
+      const result = await getAutomationExecutionForOperations(request.authUser!, parsedId.data);
+      if (!result) {
+        response.status(404).json({ message: "Không tìm thấy lần thực thi trong phạm vi truy cập." });
+        return;
+      }
+      response.json(result);
+    } catch (error) {
+      next(error);
+    }
+  },
+);
+
+// GET /api/automations/observability/metrics
+automationsRouter.get(
+  "/observability/metrics",
+  requireAnyPermission("automation.manage", "automation.view_logs", "automation.view"),
+  async (request, response, next) => {
+    try {
+      const parsed = metricsQuerySchema.safeParse(request.query);
+      const rangeEnd = parsed.success ? parsed.data.to ?? new Date() : new Date();
+      const rangeStart = parsed.success ? parsed.data.from ?? new Date(rangeEnd.getTime() - 24 * 60 * 60_000) : rangeEnd;
+      const rangeMs = rangeEnd.getTime() - rangeStart.getTime();
+      if (!parsed.success || rangeMs < 0 || rangeMs > 90 * 24 * 60 * 60_000) {
+        response.status(400).json({ message: "Khoảng thời gian thống kê không hợp lệ." });
+        return;
+      }
+      response.json(await getAutomationOperationalMetrics(request.authUser!, parsed.data.from, parsed.data.to));
+    } catch (error) {
+      next(error);
+    }
+  },
+);
+
+automationsRouter.get(
+  "/observability/rules/:ruleId/owners",
+  requireAnyPermission("automation.manage", "automation.transfer_owner"),
+  async (request, response, next) => {
+    try {
+      const parsedId = entityIdSchema.safeParse(request.params.ruleId);
+      const parsedQuery = ownerCandidatesQuerySchema.safeParse(request.query);
+      if (!parsedId.success || !parsedQuery.success) {
+        response.status(400).json({ message: "Mã automation không hợp lệ." });
+        return;
+      }
+      const result = await listAutomationOwnerCandidates(request.authUser!, parsedId.data, parsedQuery.data.search);
+      if (!result) {
+        response.status(404).json({ message: "Không tìm thấy automation rule trong phạm vi truy cập." });
+        return;
+      }
+      response.json({ data: result });
+    } catch (error) {
+      next(error);
+    }
+  },
+);
+
+automationsRouter.get(
+  "/observability/transfer-rules",
+  requireAnyPermission("automation.manage", "automation.transfer_owner"),
+  async (request, response, next) => {
+    try {
+      const parsed = transferRulesQuerySchema.safeParse(request.query);
+      if (!parsed.success) {
+        response.status(400).json({ message: "Bộ lọc rule không hợp lệ." });
+        return;
+      }
+      response.json({ data: await listAutomationTransferRules(request.authUser!, parsed.data.search) });
+    } catch (error) {
+      next(error);
+    }
+  },
+);
+
+automationsRouter.post(
+  "/observability/executions/:executionId/retry",
+  requireAnyPermission("automation.manage", "automation.retry"),
+  async (request, response, next) => {
+    try {
+      const parsedId = entityIdSchema.safeParse(request.params.executionId);
+      if (!parsedId.success) {
+        response.status(400).json({ message: "Mã execution không hợp lệ." });
+        return;
+      }
+      const result = await retryAutomationExecution(request.authUser!, parsedId.data, request.ip);
+      if (!result.ok) {
+        const status = result.reason === "not_found" ? 404
+          : result.reason === "scope_denied" ? 403
+            : result.reason === "queue_unavailable" ? 503
+              : result.reason === "context_expired" ? 422
+                : 409;
+        response.status(status).json({
+          message: result.reason === "queue_unavailable"
+            ? "Hàng đợi automation hiện không khả dụng."
+            : result.reason === "scope_denied"
+              ? "Snapshot của execution nằm ngoài phạm vi truy cập hiện tại."
+              : result.reason === "context_expired"
+                ? "Context của execution đã hết thời hạn lưu trữ nên không thể retry."
+            : result.reason === "nothing_to_retry"
+              ? "Execution không có node lỗi hoặc node chưa hoàn thành để chạy lại."
+              : result.reason === "not_recoverable" || result.reason === "already_recovered"
+                ? "Execution không ở trạng thái có thể recovery hoặc đã được xử lý bởi yêu cầu khác."
+              : "Không tìm thấy execution trong phạm vi truy cập.",
+        });
+        return;
+      }
+      response.status(202).json(result.data);
+    } catch (error) {
+      next(error);
+    }
+  },
+);
+
+automationsRouter.post(
+  "/observability/executions/:executionId/replay",
+  requireAnyPermission("automation.manage", "automation.retry"),
+  async (request, response, next) => {
+    try {
+      const parsedId = entityIdSchema.safeParse(request.params.executionId);
+      const parsedBody = replaySchema.safeParse(request.body);
+      if (!parsedId.success || !parsedBody.success) {
+        response.status(400).json({ message: "Mã execution không hợp lệ." });
+        return;
+      }
+      const result = await replayAutomationExecution(request.authUser!, parsedId.data, parsedBody.data.requestId, request.ip);
+      if (!result.ok) {
+        response.status(result.reason === "queue_unavailable" ? 503 : result.reason === "not_found" ? 404 : 422).json({
+          message: result.reason === "queue_unavailable"
+            ? "Hàng đợi automation hiện không khả dụng."
+            : result.reason === "not_found"
+              ? "Không tìm thấy execution trong phạm vi truy cập."
+              : result.reason === "scope_denied"
+                ? "Snapshot của execution nằm ngoài phạm vi truy cập hiện tại."
+              : result.reason === "context_expired"
+                ? "Context của execution đã hết thời hạn lưu trữ nên không thể replay."
+              : "Snapshot của execution không còn hợp lệ để chạy lại.",
+        });
+        return;
+      }
+      response.status(202).json(result.data);
+    } catch (error) {
+      next(error);
+    }
+  },
+);
+
+automationsRouter.get(
+  "/:id/versions",
+  requireAnyPermission("automation.manage", "automation.view_logs", "automation.view"),
+  async (request, response, next) => {
+    try {
+      const parsedId = entityIdSchema.safeParse(request.params.id);
+      if (!parsedId.success) {
+        response.status(400).json({ message: "Mã automation không hợp lệ." });
+        return;
+      }
+      const result = await listAutomationRuleVersions(request.authUser!, parsedId.data);
+      if (!result) {
+        response.status(404).json({ message: "Không tìm thấy automation rule." });
+        return;
+      }
+      response.json({ data: result });
+    } catch (error) {
+      next(error);
+    }
+  },
+);
+
+automationsRouter.post(
+  "/:id/versions/:versionId/rollback",
+  requireAnyPermission("automation.manage", "automation.update"),
+  async (request, response, next) => {
+    try {
+      const parsedRuleId = entityIdSchema.safeParse(request.params.id);
+      const parsedVersionId = entityIdSchema.safeParse(request.params.versionId);
+      if (!parsedRuleId.success || !parsedVersionId.success) {
+        response.status(400).json({ message: "Mã rule hoặc phiên bản không hợp lệ." });
+        return;
+      }
+      const result = await rollbackAutomationRule(request.authUser!, parsedRuleId.data, parsedVersionId.data, request.ip);
+      if (!result.ok) {
+        response.status(result.reason === "rule_active" ? 409 : result.reason === "scope_denied" ? 403 : 404).json({
+          message: result.reason === "rule_active"
+            ? "Hãy tắt rule trước khi khôi phục phiên bản."
+            : result.reason === "scope_denied"
+              ? "Phiên bản này nằm ngoài phạm vi truy cập hiện tại."
+              : "Không tìm thấy rule hoặc phiên bản cần khôi phục.",
+        });
+        return;
+      }
+      response.json(result.data);
+    } catch (error) {
+      next(error);
+    }
+  },
+);
+
+automationsRouter.patch(
+  "/:id/owner",
+  requireAnyPermission("automation.manage", "automation.transfer_owner"),
+  async (request, response, next) => {
+    try {
+      const parsedRuleId = entityIdSchema.safeParse(request.params.id);
+      const parsedBody = transferOwnerSchema.safeParse(request.body);
+      if (!parsedRuleId.success || !parsedBody.success) {
+        response.status(400).json({ message: "Thông tin chuyển người phụ trách không hợp lệ." });
+        return;
+      }
+      const result = await transferAutomationRuleOwner(request.authUser!, parsedRuleId.data, parsedBody.data.ownerId, request.ip);
+      if (!result.ok) {
+        response.status(result.reason === "not_found" ? 404 : 422).json({
+          message: result.reason === "not_found"
+            ? "Không tìm thấy automation rule."
+            : "Người nhận cần đang hoạt động, có quyền quản lý automation và đúng phạm vi chương trình.",
+        });
+        return;
+      }
+      response.json(result.data);
+    } catch (error) {
+      next(error);
+    }
+  },
+);
+
+// POST /api/automations/:id/validate
+automationsRouter.post(
+  "/:id/validate",
+  requireAnyPermission("automation.manage"),
+  async (request, response, next) => {
+    try {
+      const parsedId = entityIdSchema.safeParse(request.params.id);
+      if (!parsedId.success) {
+        response.status(400).json({ message: "Mã automation không hợp lệ." });
+        return;
+      }
+      const validation = await validateAutomationRule(request.authUser!, parsedId.data);
+      if (!validation) {
+        response.status(404).json({ message: "Không tìm thấy automation rule." });
+        return;
+      }
+      response.status(validation.valid ? 200 : 422).json(validation);
+    } catch (error) {
+      next(error);
+    }
+  },
+);
+
+// GET /api/automations/:id/test-leads
+automationsRouter.get(
+  "/:id/test-leads",
+  requireAnyPermission("automation.manage"),
+  requireAnyPermission(...leadListPermissions),
+  async (request, response, next) => {
+    try {
+      const parsedId = entityIdSchema.safeParse(request.params.id);
+      const parsedQuery = testLeadQuerySchema.safeParse(request.query);
+      if (!parsedId.success || !parsedQuery.success) {
+        response.status(400).json({ message: "Tham số tìm Lead chạy thử không hợp lệ." });
+        return;
+      }
+      const result = await listAutomationTestLeads(request.authUser!, parsedId.data, parsedQuery.data);
+      if (!result) {
+        response.status(404).json({ message: "Không tìm thấy automation rule." });
+        return;
+      }
+      response.json(result);
+    } catch (error) {
+      next(error);
+    }
+  },
+);
+
+// POST /api/automations/:id/test-run
+automationsRouter.post(
+  "/:id/test-run",
+  requireAnyPermission("automation.manage"),
+  requireAnyPermission(...leadListPermissions),
+  async (request, response, next) => {
+    try {
+      const parsedId = entityIdSchema.safeParse(request.params.id);
+      const parsedBody = testRunSchema.safeParse(request.body);
+      if (!parsedId.success || !parsedBody.success) {
+        response.status(400).json({ message: "Dữ liệu chạy thử automation không hợp lệ." });
+        return;
+      }
+      const result = await runAutomationTest(request.authUser!, parsedId.data, parsedBody.data.leadId);
+      if (!result.ok) {
+        if (result.reason === "rule_not_found" || result.reason === "lead_not_found") {
+          response.status(404).json({
+            message: result.reason === "rule_not_found"
+              ? "Không tìm thấy automation rule."
+              : "Không tìm thấy Lead trong phạm vi truy cập hoặc phạm vi chương trình của rule.",
+          });
+          return;
+        }
+        if (result.reason === "queue_unavailable") {
+          response.status(503).json({ message: "Automation worker hiện không khả dụng." });
+          return;
+        }
+        response.status(422).json({
+          message: "Rule chưa hợp lệ để chạy thử.",
+          validation: "validation" in result ? result.validation : undefined,
+        });
+        return;
+      }
+      response.status(202).json(result.data);
+    } catch (error) {
+      next(error);
+    }
+  },
+);
+
+// POST /api/automations/:id/bulk-preview
+automationsRouter.post(
+  "/:id/bulk-preview",
+  requireAnyPermission("automation.manage"),
+  requireAnyPermission(...leadListPermissions),
+  async (request, response, next) => {
+    try {
+      const parsedId = entityIdSchema.safeParse(request.params.id);
+      const parsedBody = bulkRunSchema.safeParse(request.body);
+      if (!parsedId.success || !parsedBody.success) {
+        response.status(400).json({ message: "Dữ liệu xem trước lượt chạy hàng loạt không hợp lệ." });
+        return;
+      }
+      const result = await previewAutomationBulkRun(request.authUser!, parsedId.data, parsedBody.data);
+      if (!result.ok) {
+        response.status(404).json({
+          message: result.reason === "rule_not_found"
+            ? "Không tìm thấy automation rule."
+            : "Không tìm thấy tập lead trong phạm vi truy cập của rule.",
+        });
+        return;
+      }
+      response.json(result.data);
+    } catch (error) {
+      if (error instanceof LeadFilterError) { response.status(error.status).json({ message: error.message }); return; }
+      next(error);
+    }
+  },
+);
+
+// POST /api/automations/:id/bulk-run
+automationsRouter.post(
+  "/:id/bulk-run",
+  requireAnyPermission("automation.manage"),
+  requireAnyPermission(...leadListPermissions),
+  async (request, response, next) => {
+    try {
+      const parsedId = entityIdSchema.safeParse(request.params.id);
+      const parsedBody = bulkRunSchema.safeParse(request.body);
+      if (!parsedId.success || !parsedBody.success) {
+        response.status(400).json({ message: "Dữ liệu chạy automation hàng loạt không hợp lệ." });
+        return;
+      }
+      const parsedRequestId = z.uuid().optional().safeParse(request.get("Idempotency-Key"));
+      if (!parsedRequestId.success) { response.status(400).json({ message: "Mã yêu cầu chạy lại không hợp lệ." }); return; }
+      const result = await startAutomationBulkRun(request.authUser!, parsedId.data, parsedBody.data, parsedRequestId.data);
+      if (!result.ok) {
+        if (result.reason === "rule_not_found" || result.reason === "filter_not_found") {
+          response.status(404).json({ message: "Không tìm thấy rule hoặc tập lead trong phạm vi truy cập." });
+          return;
+        }
+        if (result.reason === "queue_unavailable") {
+          response.status(503).json({ message: "Automation worker hiện không khả dụng." });
+          return;
+        }
+        response.status(422).json({
+          message: result.reason === "empty_filter"
+            ? "Không có lead phù hợp trong phạm vi đã chọn."
+            : "Rule chưa hợp lệ để chạy hàng loạt.",
+          validation: "validation" in result ? result.validation : undefined,
+        });
+        return;
+      }
+      response.status(202).json(result.data);
+    } catch (error) {
+      if (error instanceof LeadFilterError) { response.status(error.status).json({ message: error.message }); return; }
+      next(error);
+    }
+  },
+);
+
+// GET /api/automations/:id/bulk-runs/:jobId
+automationsRouter.get(
+  "/:id/bulk-runs/:jobId",
+  requireAnyPermission("automation.manage"),
+  requireAnyPermission(...leadListPermissions),
+  async (request, response, next) => {
+    try {
+      const parsedRuleId = entityIdSchema.safeParse(request.params.id);
+      const parsedJobId = entityIdSchema.safeParse(request.params.jobId);
+      if (!parsedRuleId.success || !parsedJobId.success) {
+        response.status(400).json({ message: "Mã lượt chạy hàng loạt không hợp lệ." });
+        return;
+      }
+      const job = await getAutomationBulkRun(request.authUser!, parsedRuleId.data, parsedJobId.data);
+      if (!job) {
+        response.status(404).json({ message: "Không tìm thấy lượt chạy hàng loạt." });
+        return;
+      }
+      response.json(job);
+    } catch (error) {
+      next(error);
+    }
+  },
+);
+
+// GET /api/automations/:id
+automationsRouter.get(
+  "/:id",
+  requireAnyPermission("automation.manage"),
+  async (request, response, next) => {
+    try {
+      const parsedId = entityIdSchema.safeParse(request.params.id);
+      if (!parsedId.success) {
+        response.status(400).json({ message: "Mã automation không hợp lệ." });
+        return;
+      }
+      const rule = await getAutomationRule(request.authUser!, parsedId.data);
+      if (!rule) {
+        response.status(404).json({ message: "Không tìm thấy automation rule." });
+        return;
+      }
+      response.json(rule);
+    } catch (error) {
+      next(error);
+    }
+  },
+);
+
+// POST /api/automations
+automationsRouter.post(
+  "/",
+  requireAnyPermission("automation.manage"),
+  async (request, response, next) => {
+    try {
+      const parsed = createSchema.safeParse(request.body);
+      if (!parsed.success) {
+        response.status(400).json({ message: "Thông tin automation rule không hợp lệ." });
+        return;
+      }
+      const rule = await createAutomationRule(request.authUser!, parsed.data);
+      if (!rule) {
+        response.status(403).json({ message: "Bạn không có quyền tạo rule toàn hệ thống hoặc ngoài phạm vi chương trình được giao." });
+        return;
+      }
+      response.status(201).json(rule);
+    } catch (error) {
+      next(error);
+    }
+  },
+);
+
+// POST /api/automations/:id/duplicate
+automationsRouter.post(
+  "/:id/duplicate",
+  requireAnyPermission("automation.manage"),
+  async (request, response, next) => {
+    try {
+      const parsedId = entityIdSchema.safeParse(request.params.id);
+      if (!parsedId.success) {
+        response.status(400).json({ message: "Mã automation không hợp lệ." });
+        return;
+      }
+      const rule = await duplicateAutomationRule(request.authUser!, parsedId.data, request.ip);
+      if (!rule) {
+        response.status(404).json({ message: "Không tìm thấy automation rule." });
+        return;
+      }
+      response.status(201).json(rule);
+    } catch (error) {
+      next(error);
+    }
+  },
+);
+
+// PATCH /api/automations/:id
+automationsRouter.patch(
+  "/:id",
+  requireAnyPermission("automation.manage"),
+  async (request, response, next) => {
+    try {
+      const parsedId = entityIdSchema.safeParse(request.params.id);
+      const parsedBody = updateSchema.safeParse(request.body);
+      if (!parsedId.success || !parsedBody.success) {
+        response.status(400).json({ message: "Dữ liệu cập nhật automation không hợp lệ." });
+        return;
+      }
+      const updated = await updateAutomationRule(request.authUser!, parsedId.data, parsedBody.data);
+      if (!updated) {
+        response.status(404).json({ message: "Không tìm thấy automation rule." });
+        return;
+      }
+      if (!updated.ok) {
+        if (updated.reason === "invalid_information_update") {
+          response.status(422).json({ message: updated.message });
+          return;
+        }
+        response.status(409).json({ message: "Hãy tắt rule trước khi thay đổi cấu hình thực thi." });
+        return;
+      }
+      response.json(updated.data);
+    } catch (error) {
+      next(error);
+    }
+  },
+);
+
+// PATCH /api/automations/:id/toggle
+automationsRouter.patch(
+  "/:id/toggle",
+  requireAnyPermission("automation.manage"),
+  async (request, response, next) => {
+    try {
+      const parsedId = entityIdSchema.safeParse(request.params.id);
+      const parsedBody = toggleSchema.safeParse(request.body);
+      if (!parsedId.success || !parsedBody.success) {
+        response.status(400).json({ message: "Dữ liệu bật/tắt automation không hợp lệ." });
+        return;
+      }
+      const updated = await toggleAutomationRule(request.authUser!, parsedId.data, parsedBody.data.isActive);
+      if (!updated) {
+        response.status(404).json({ message: "Không tìm thấy automation rule." });
+        return;
+      }
+      if (!updated.ok) {
+        response.status(422).json({
+          message: updated.reason === "unsupported_trigger"
+            ? "Sự kiện kích hoạt này chưa được hệ thống hỗ trợ thực thi."
+            : "Rule chưa hợp lệ. Vui lòng sửa các node và kết nối trước khi bật.",
+          validation: updated.validation,
+        });
+        return;
+      }
+      response.json(updated.data);
+    } catch (error) {
+      next(error);
+    }
+  },
+);
+
+// DELETE /api/automations/:id
+automationsRouter.delete(
+  "/:id",
+  requireAnyPermission("automation.manage"),
+  async (request, response, next) => {
+    try {
+      const parsedId = entityIdSchema.safeParse(request.params.id);
+      if (!parsedId.success) {
+        response.status(400).json({ message: "Mã automation không hợp lệ." });
+        return;
+      }
+      const result = await archiveAutomationRule(request.authUser!, parsedId.data, request.ip);
+      if (!result) {
+        response.status(404).json({ message: "Không tìm thấy automation rule." });
+        return;
+      }
+      if (!result.ok) {
+        response.status(409).json({ message: "Không thể lưu trữ rule đang được bật. Vui lòng tắt rule trước." });
+        return;
+      }
+      response.json({ message: "Đã lưu trữ automation rule." });
+    } catch (error) {
+      next(error);
+    }
+  },
+);
+
+// GET /api/automations/:id/logs
+automationsRouter.get(
+  "/:id/logs",
+  requireAnyPermission("automation.manage"),
+  async (request, response, next) => {
+    try {
+      const parsedId = entityIdSchema.safeParse(request.params.id);
+      const parsedQuery = logQuerySchema.safeParse(request.query);
+      if (!parsedId.success || !parsedQuery.success) {
+        response.status(400).json({ message: "Tham số không hợp lệ." });
+        return;
+      }
+      const result = await listExecutionLogs(request.authUser!, parsedId.data, parsedQuery.data.page, parsedQuery.data.limit);
+      if (!result) {
+        response.status(404).json({ message: "Không tìm thấy automation rule." });
+        return;
+      }
+      response.json(result);
+    } catch (error) {
+      next(error);
+    }
+  },
+);
+
+// GET /api/automations/:id/logs/:executionId
+automationsRouter.get(
+  "/:id/logs/:executionId",
+  requireAnyPermission("automation.manage"),
+  async (request, response, next) => {
+    try {
+      const parsedRuleId = entityIdSchema.safeParse(request.params.id);
+      const parsedExecutionId = entityIdSchema.safeParse(request.params.executionId);
+      if (!parsedRuleId.success || !parsedExecutionId.success) {
+        response.status(400).json({ message: "Mã execution không hợp lệ." });
+        return;
+      }
+      const execution = await getAutomationExecution(request.authUser!, parsedRuleId.data, parsedExecutionId.data);
+      if (!execution) {
+        response.status(404).json({ message: "Không tìm thấy lần thực thi automation." });
+        return;
+      }
+      response.json(execution);
+    } catch (error) {
+      next(error);
+    }
+  },
+);

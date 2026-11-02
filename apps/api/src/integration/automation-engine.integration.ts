@@ -1,0 +1,799 @@
+import assert from "node:assert/strict";
+import { randomUUID } from "node:crypto";
+import type { AddressInfo } from "node:net";
+
+import { hash } from "bcryptjs";
+
+type JsonRecord = Record<string, any>;
+type PrismaHandle = typeof import("../database/prisma.js")["prisma"];
+
+const runId = randomUUID().slice(0, 8);
+const password = `Automation-${runId}`;
+const actorRoleCode = `AUTO_ACTOR_${runId}`.toUpperCase();
+const targetRoleCode = `AUTO_TARGET_${runId}`.toUpperCase();
+const scopedRoleCode = `AUTO_SCOPED_${runId}`.toUpperCase();
+const notificationTitle = `[AUTOMATION ${runId}] Thông báo nhánh đúng`;
+const activityContent = `[AUTOMATION ${runId}] Hoàn tất nhánh đúng`;
+const delayedActivityContent = `[AUTOMATION ${runId}] Hoàn tất sau delay`;
+const matchingLeadName = `Automation Matching Lead ${runId}`;
+
+const permissionDefinitions = [
+  { code: "student.view", name: "Xem sinh viên", module: "student" },
+  { code: "automation.manage", name: "Quản lý Rule Automation", module: "system" },
+  { code: "automation.manage_global", name: "Quản lý Rule Automation toàn hệ thống", module: "system" },
+  { code: "audit.view", name: "Xem audit log", module: "system" },
+  { code: "lead.view_all", name: "Xem toàn bộ lead", module: "lead" },
+  { code: "lead.view_department", name: "Xem lead trong phòng ban", module: "lead" },
+  { code: "lead.view_assigned", name: "Xem lead được phân công", module: "lead" },
+  { code: "lead.update_all", name: "Cập nhật toàn bộ lead", module: "lead" },
+  { code: "lead.assign", name: "Phân công lead", module: "lead" },
+  { code: "lead_activity.create", name: "Ghi hoạt động chăm sóc lead", module: "lead" },
+  { code: "admission.update", name: "Cập nhật hồ sơ tuyển sinh", module: "admission" },
+  { code: "admission_document.upload", name: "Yêu cầu tài liệu tuyển sinh", module: "admission" },
+  { code: "admission_status.update", name: "Cập nhật trạng thái hồ sơ", module: "admission" },
+  { code: "admission.approve", name: "Duyệt hồ sơ tuyển sinh", module: "admission" },
+  { code: "student.create_from_admission", name: "Chuyển hồ sơ thành sinh viên", module: "student" },
+] as const;
+
+let prisma: PrismaHandle;
+let ruleId: string | null = null;
+const createdRuleIds: string[] = [];
+const formEventJobIds: string[] = [];
+let pipelineId: string | null = null;
+let departmentId: string | null = null;
+const stageIds: string[] = [];
+const leadIds: string[] = [];
+const userIds: string[] = [];
+const roleIds: string[] = [];
+const permissionSnapshots: Array<{ id: string; existed: boolean; isActive: boolean | null }> = [];
+const customFieldIds: string[] = [];
+const admissionStatusIds: string[] = [];
+
+async function request(
+  baseUrl: string,
+  path: string,
+  options: { token?: string; method?: string; body?: unknown } = {},
+) {
+  const response = await fetch(`${baseUrl}${path}`, {
+    method: options.method ?? "GET",
+    headers: {
+      "Content-Type": "application/json",
+      ...(options.token ? { Authorization: `Bearer ${options.token}` } : {}),
+    },
+    body: options.body === undefined ? undefined : JSON.stringify(options.body),
+  });
+  return {
+    status: response.status,
+    payload: (await response.json().catch(() => ({}))) as JsonRecord,
+  };
+}
+
+async function login(baseUrl: string, email: string) {
+  const result = await request(baseUrl, "/auth/login", {
+    method: "POST",
+    body: { email, password },
+  });
+  assert.equal(result.status, 200, `Đăng nhập ${email} phải thành công.`);
+  assert.equal(typeof result.payload.accessToken, "string", "Login phải trả access token.");
+  return result.payload.accessToken as string;
+}
+
+async function waitForExecution(baseUrl: string, token: string, executionId: string) {
+  const deadline = Date.now() + 15_000;
+  while (Date.now() < deadline) {
+    const result = await request(baseUrl, `/automations/${ruleId}/logs/${executionId}`, { token });
+    assert.equal(result.status, 200, "Phải đọc được execution qua API.");
+    if (["completed", "failed"].includes(result.payload.status)) return result.payload;
+    await new Promise((resolve) => setTimeout(resolve, 100));
+  }
+  assert.fail(`Execution ${executionId} không kết thúc trong thời gian chờ.`);
+}
+
+async function waitForDelayedCheckpoint(baseUrl: string, token: string, executionId: string) {
+  const deadline = Date.now() + 5_000;
+  while (Date.now() < deadline) {
+    const result = await request(baseUrl, `/automations/${ruleId}/logs/${executionId}`, { token });
+    assert.equal(result.status, 200, "Phải đọc được execution đang delay qua API.");
+    const delayNode = result.payload.nodes.find((node: JsonRecord) => node.nodeId === "delay");
+    if (delayNode?.status === "completed") return result.payload;
+    await new Promise((resolve) => setTimeout(resolve, 25));
+  }
+  assert.fail(`Execution ${executionId} không đi vào trạng thái delay đúng hạn.`);
+}
+
+async function ensurePermission(definition: typeof permissionDefinitions[number]) {
+  const existing = await prisma.permissions.findUnique({ where: { code: definition.code } });
+  if (existing) {
+    permissionSnapshots.push({ id: existing.id, existed: true, isActive: existing.is_active });
+    if (existing.is_active !== true) {
+      return prisma.permissions.update({ where: { id: existing.id }, data: { is_active: true } });
+    }
+    return existing;
+  }
+  const created = await prisma.permissions.create({ data: { ...definition, is_active: true } });
+  permissionSnapshots.push({ id: created.id, existed: false, isActive: null });
+  return created;
+}
+
+async function createFixtures() {
+  const program = await prisma.institution_programs.findFirst({
+    where: { status: "active" },
+    select: { id: true },
+    orderBy: { created_at: "asc" },
+  });
+  assert.ok(program, "Integration test yêu cầu ít nhất một chương trình tuyển sinh đang hoạt động.");
+  const permissions = await Promise.all(permissionDefinitions.map(ensurePermission));
+  const permissionByCode = new Map(permissions.map((permission) => [permission.code, permission]));
+  const [actorRole, targetRole, scopedRole] = await Promise.all([
+    prisma.roles.create({ data: { code: actorRoleCode, name: `Automation Actor ${runId}` } }),
+    prisma.roles.create({ data: { code: targetRoleCode, name: `Automation Target ${runId}` } }),
+    prisma.roles.create({ data: { code: scopedRoleCode, name: `Automation Scoped ${runId}` } }),
+  ]);
+  roleIds.push(actorRole.id, targetRole.id, scopedRole.id);
+  await prisma.role_access_scopes.createMany({ data: [
+    { role_id: actorRole.id, scope_code: "ALL" },
+    { role_id: targetRole.id, scope_code: "ASSIGNED_ONLY" },
+    { role_id: scopedRole.id, scope_code: "ASSIGNED_ONLY" },
+  ] });
+  await prisma.role_institution_programs.createMany({ data: [
+    { role_id: actorRole.id, institution_program_id: program.id },
+    { role_id: targetRole.id, institution_program_id: program.id },
+    { role_id: scopedRole.id, institution_program_id: program.id },
+  ] });
+  await prisma.role_permissions.createMany({ data: [
+    ...permissions
+      .filter((permission) => !["lead.view_assigned", "lead.view_department"].includes(permission.code))
+      .map((permission) => ({ role_id: actorRole.id, permission_id: permission.id })),
+    {
+      role_id: targetRole.id,
+      permission_id: permissionByCode.get("lead.view_assigned")!.id,
+    },
+    ...permissions
+      .filter((permission) => !["automation.manage_global", "lead.view_all"].includes(permission.code))
+      .map((permission) => ({ role_id: scopedRole.id, permission_id: permission.id })),
+  ] });
+
+  const passwordHash = await hash(password, 10);
+  const [actor, target, scoped] = await Promise.all([
+    prisma.users.create({
+      data: {
+        email: `automation.actor.${runId}@example.test`,
+        password_hash: passwordHash,
+        full_name: `Automation Actor ${runId}`,
+        status: "active",
+      },
+    }),
+    prisma.users.create({
+      data: {
+        email: `automation.target.${runId}@example.test`,
+        password_hash: passwordHash,
+        full_name: `Automation Target ${runId}`,
+        status: "active",
+      },
+    }),
+    prisma.users.create({
+      data: {
+        email: `automation.scoped.${runId}@example.test`,
+        password_hash: passwordHash,
+        full_name: `Automation Scoped ${runId}`,
+        status: "active",
+      },
+    }),
+  ]);
+  userIds.push(actor.id, target.id, scoped.id);
+  const department = await prisma.departments.create({
+    data: { code: `AUTO-${runId}`.toUpperCase(), name: `Automation Sale ${runId}` },
+    select: { id: true },
+  });
+  departmentId = department.id;
+  await prisma.user_departments.createMany({
+    data: [actor.id, target.id, scoped.id].map((userId) => ({ user_id: userId, department_id: department.id })),
+  });
+  await prisma.user_roles.createMany({
+    data: [
+      { user_id: actor.id, role_id: actorRole.id },
+      { user_id: target.id, role_id: targetRole.id },
+      { user_id: scoped.id, role_id: scopedRole.id },
+    ],
+  });
+  await prisma.user_program_roles.createMany({ data: [
+    { user_id: actor.id, role_id: actorRole.id, institution_program_id: program.id },
+    { user_id: target.id, role_id: targetRole.id, institution_program_id: program.id },
+    { user_id: scoped.id, role_id: scopedRole.id, institution_program_id: program.id },
+  ] });
+  await prisma.user_access_scopes.createMany({
+    data: [
+      { user_id: actor.id, scope: "ALL" },
+      { user_id: target.id, scope: "ASSIGNED_ONLY" },
+      { user_id: scoped.id, scope: "ASSIGNED_ONLY" },
+    ],
+  });
+
+  const pipeline = await prisma.pipelines.create({
+    data: { name: `Automation Pipeline ${runId}`, module: "lead" },
+  });
+  pipelineId = pipeline.id;
+  const [initialStage, targetStage] = await Promise.all([
+    prisma.pipeline_stages.create({
+      data: { pipeline_id: pipeline.id, name: `Ban đầu ${runId}`, position: 1 },
+    }),
+    prisma.pipeline_stages.create({
+      data: { pipeline_id: pipeline.id, name: `Đã tự động ${runId}`, position: 2 },
+    }),
+  ]);
+  stageIds.push(initialStage.id, targetStage.id);
+
+  const major = await prisma.majors.findFirst({
+    where: { OR: [{ institution_program_id: program.id }, { institution_program_id: null }] },
+    select: { id: true },
+    orderBy: { created_at: "asc" },
+  });
+  assert.ok(major, "Integration test yêu cầu ít nhất một ngành phù hợp với chương trình tuyển sinh.");
+  const [initialAdmissionStatus, nextAdmissionStatus] = await Promise.all([
+    prisma.admission_statuses.create({ data: { code: `AUTO_INITIAL_${runId}`.toUpperCase(), name: `Automation ban đầu ${runId}` } }),
+    prisma.admission_statuses.upsert({
+      where: { code: "APPROVED" },
+      update: {},
+      create: { code: "APPROVED", name: "Đã duyệt hồ sơ", color: "#2563EB" },
+    }),
+  ]);
+  admissionStatusIds.push(initialAdmissionStatus.id);
+
+  const [matchingLead, nonMatchingLead] = await Promise.all([
+    prisma.leads.create({
+      data: {
+        full_name: matchingLeadName,
+        phone: `091${Date.now().toString().slice(-7)}`,
+        status: "new",
+        pipeline_stage_id: initialStage.id,
+        institution_program_id: program.id,
+        major_id: major.id,
+      },
+    }),
+    prisma.leads.create({
+      data: {
+        full_name: `Automation Non-matching Lead ${runId}`,
+        phone: `092${(Date.now() + 1).toString().slice(-7)}`,
+        status: "closed",
+        pipeline_stage_id: initialStage.id,
+        institution_program_id: program.id,
+        major_id: major.id,
+      },
+    }),
+  ]);
+  leadIds.push(matchingLead.id, nonMatchingLead.id);
+  const customFieldGroup = await prisma.custom_field_groups.findFirst({
+    where: { entity_type: "LEAD", is_active: true, archived_at: null },
+    select: { id: true },
+    orderBy: { display_order: "asc" },
+  });
+  assert.ok(customFieldGroup, "Integration test yêu cầu nhóm trường dữ liệu Lead đang hoạt động.");
+  const customField = await prisma.custom_fields.create({
+    data: {
+      module: "LEAD",
+      entity_type: "LEAD",
+      group_id: customFieldGroup.id,
+      field_key: `automation_segment_${runId}`,
+      field_label: `Phân khúc Automation ${runId}`,
+      field_type: "TEXT",
+      scope_type: "GLOBAL",
+      is_active: true,
+      is_required: false,
+      is_sensitive: false,
+    },
+  });
+  customFieldIds.push(customField.id);
+  await prisma.custom_field_values.create({
+    data: {
+      custom_field_id: customField.id,
+      entity_type: "LEAD",
+      entity_id: matchingLead.id,
+      value: "VIP",
+      value_text: "VIP",
+    },
+  });
+  return { actor, target, scoped, program, initialStage, targetStage, matchingLead, nonMatchingLead, customField, major, initialAdmissionStatus, nextAdmissionStatus };
+}
+
+function automationGraph(targetUserId: string, targetStageId: string, customFieldId: string, majorId: string, initialAdmissionStatusId: string, nextAdmissionStatusId: string) {
+  return {
+    nodes: [
+      { id: "trigger", type: "trigger", position: { x: 0, y: 0 }, data: { label: "Lead được tạo", triggerType: "lead_created" } },
+      { id: "condition", type: "condition", position: { x: 250, y: 0 }, data: { label: "Lead VIP", field: `custom:${customFieldId}`, operator: "equals", value: "VIP" } },
+      { id: "notification", type: "action_notification", position: { x: 500, y: -120 }, data: { label: "Thông báo", title: `${notificationTitle} {{system:fullName}}`, content: "Rule integration đã chạy nhánh đúng.", targetRole: targetRoleCode } },
+      { id: "assign", type: "action_assign", position: { x: 750, y: -120 }, data: { label: "Phân công", assignToUserId: targetUserId } },
+      { id: "stage", type: "action_update_stage", position: { x: 1000, y: -120 }, data: { label: "Đổi pipeline", stageId: targetStageId } },
+      { id: "create_admission", type: "action_create_admission", position: { x: 1250, y: -120 }, data: { label: "Tạo hồ sơ", admissionMajorId: majorId, admissionStatusId: initialAdmissionStatusId } },
+      { id: "request_document", type: "action_request_document", position: { x: 1500, y: -120 }, data: { label: "Yêu cầu CCCD", admissionDocumentType: "CCCD" } },
+      { id: "update_admission", type: "action_update_admission_status", position: { x: 1750, y: -120 }, data: { label: "Đổi trạng thái hồ sơ", admissionStatusId: nextAdmissionStatusId } },
+      { id: "convert_student", type: "action_convert_student", position: { x: 2000, y: -120 }, data: { label: "Chuyển sinh viên" } },
+      { id: "activity", type: "action_activity", position: { x: 2250, y: -120 }, data: { label: "Ghi hoạt động", activityType: "automation_integration", activityContent: `${activityContent} {{system:fullName}}` } },
+      { id: "delay", type: "delay", position: { x: 500, y: 160 }, data: { label: "Chờ nhánh sai", delayMinutes: 1 } },
+      { id: "delayed_activity", type: "action_activity", position: { x: 750, y: 160 }, data: { label: "Ghi sau delay", activityType: "automation_integration_delay", activityContent: delayedActivityContent } },
+      { id: "terminal_delay", type: "delay", position: { x: 1000, y: 160 }, data: { label: "Delay kết thúc", delayMinutes: 1 } },
+    ],
+    edges: [
+      { id: "e-trigger-condition", source: "trigger", target: "condition" },
+      { id: "e-condition-true", source: "condition", target: "notification", sourceHandle: "default" },
+      { id: "e-condition-false", source: "condition", target: "delay", sourceHandle: "false" },
+      { id: "e-delay-activity", source: "delay", target: "delayed_activity" },
+      { id: "e-activity-terminal-delay", source: "delayed_activity", target: "terminal_delay" },
+      { id: "e-notification-assign", source: "notification", target: "assign" },
+      { id: "e-assign-stage", source: "assign", target: "stage" },
+      { id: "e-stage-admission", source: "stage", target: "create_admission" },
+      { id: "e-admission-document", source: "create_admission", target: "request_document" },
+      { id: "e-document-status", source: "request_document", target: "update_admission" },
+      { id: "e-status-student", source: "update_admission", target: "convert_student" },
+      { id: "e-student-activity", source: "convert_student", target: "activity" },
+    ],
+  };
+}
+
+async function cleanup() {
+  if (!prisma) return;
+  if (createdRuleIds.length > 0) await prisma.automation_rules.deleteMany({ where: { id: { in: createdRuleIds } } });
+  await prisma.audit_logs.deleteMany({ where: { user_id: { in: userIds } } });
+  await prisma.notifications.deleteMany({ where: { user_id: { in: userIds } } });
+  await prisma.custom_field_values.deleteMany({ where: { custom_field_id: { in: customFieldIds } } });
+  await prisma.custom_fields.deleteMany({ where: { id: { in: customFieldIds } } });
+  await prisma.students.deleteMany({ where: { lead_id: { in: leadIds } } });
+  await prisma.admission_documents.deleteMany({ where: { lead_id: { in: leadIds } } });
+  await prisma.admission_profiles.deleteMany({ where: { lead_id: { in: leadIds } } });
+  await prisma.leads.deleteMany({ where: { id: { in: leadIds } } });
+  await prisma.user_access_scopes.deleteMany({ where: { user_id: { in: userIds } } });
+  await prisma.user_departments.deleteMany({ where: { user_id: { in: userIds } } });
+  await prisma.user_program_roles.deleteMany({ where: { user_id: { in: userIds } } });
+  await prisma.user_roles.deleteMany({ where: { user_id: { in: userIds } } });
+  await prisma.users.deleteMany({ where: { id: { in: userIds } } });
+  await prisma.role_permissions.deleteMany({ where: { role_id: { in: roleIds } } });
+  await prisma.role_institution_programs.deleteMany({ where: { role_id: { in: roleIds } } });
+  await prisma.role_access_scopes.deleteMany({ where: { role_id: { in: roleIds } } });
+  await prisma.roles.deleteMany({ where: { id: { in: roleIds } } });
+  if (departmentId) await prisma.departments.deleteMany({ where: { id: departmentId } });
+  for (const permission of permissionSnapshots) {
+    if (permission.existed) {
+      await prisma.permissions.update({ where: { id: permission.id }, data: { is_active: permission.isActive } });
+    } else {
+      await prisma.permissions.deleteMany({ where: { id: permission.id } });
+    }
+  }
+  await prisma.pipeline_stages.deleteMany({ where: { id: { in: stageIds } } });
+  if (pipelineId) await prisma.pipelines.deleteMany({ where: { id: pipelineId } });
+  await prisma.admission_statuses.deleteMany({ where: { id: { in: admissionStatusIds } } });
+}
+
+async function main() {
+  process.env.NODE_ENV = "integration";
+  process.env.AUTOMATION_QUEUE_NAME = `automation_integration_${runId}`;
+  process.env.AUTOMATION_DELAY_MS_PER_MINUTE = "1000";
+  delete process.env.DISABLE_AUTOMATION_WORKER;
+  ({ prisma } = await import("../database/prisma.js"));
+  const [{ app }, engine, { redisCommandConnection, redisConnection }, { getWebhookQueueAdapter }] = await Promise.all([
+    import("../app.js"),
+    import("../modules/automations/automation-engine.service.js"),
+    import("../config/redis.js"),
+    import("../modules/webhooks/webhook-queue.service.js"),
+  ]);
+  assert.ok(engine.automationQueue && engine.automationWorker && redisConnection, "Integration test yêu cầu Redis và worker thật.");
+  await redisConnection.ping();
+
+  const server = app.listen(0);
+  try {
+    await new Promise<void>((resolve, reject) => {
+      server.once("listening", resolve);
+      server.once("error", reject);
+    });
+    const baseUrl = `http://127.0.0.1:${(server.address() as AddressInfo).port}/api`;
+    const fixtures = await createFixtures();
+    const [{ getAuthUser }, { getAutomationOptions }] = await Promise.all([
+      import("../modules/auth/auth.service.js"),
+      import("../modules/automations/automation.service.js"),
+    ]);
+    const programScopedActor = await getAuthUser(fixtures.actor.id, fixtures.program.id);
+    assert.ok(programScopedActor, "Phải đọc được actor với chương trình làm việc đã chọn.");
+    const programScopedOptions = await getAutomationOptions(programScopedActor, fixtures.program.id);
+    const eligibleTarget = programScopedOptions?.assignmentPoolAssignees.find((assignee) => assignee.id === fixtures.target.id);
+    assert.ok(
+      eligibleTarget,
+      "Actor scope ALL trong một chương trình phải chọn được Telesale hợp lệ của chương trình đó.",
+    );
+    assert.ok(
+      departmentId && eligibleTarget.departmentIds.includes(departmentId),
+      "Tuỳ chọn Sale phải kèm phòng ban để builder lọc cùng phạm vi với runtime.",
+    );
+    assert.equal(eligibleTarget.canReceiveLead, true, "Telesale hợp lệ phải chọn được để nhận Lead.");
+    const programEmployee = programScopedOptions?.assignmentPoolAssignees.find((assignee) => assignee.id === fixtures.actor.id);
+    assert.ok(programEmployee, "Danh sách phải hiển thị cả nhân viên chương trình không phải Telesale.");
+    assert.equal(programEmployee.canReceiveLead, false, "Hiển thị nhân viên không được tự cấp quyền nhận Lead.");
+    const [actorToken, targetToken, scopedToken] = await Promise.all([
+      login(baseUrl, fixtures.actor.email),
+      login(baseUrl, fixtures.target.email),
+      login(baseUrl, fixtures.scoped.email),
+    ]);
+
+    assert.equal((await request(baseUrl, "/automations")).status, 401, "Thiếu xác thực phải bị từ chối.");
+    assert.equal(
+      (await request(baseUrl, "/automations", { token: targetToken })).status,
+      403,
+      "Thiếu automation.manage phải bị từ chối.",
+    );
+
+    const forbiddenOtherProgramRule = await request(baseUrl, "/automations", {
+      token: scopedToken,
+      method: "POST",
+      body: {
+        name: `[INTEGRATION ${runId}] Rule ngoài chương trình bị từ chối`,
+        triggerType: "lead_created",
+        institutionProgramId: randomUUID(),
+      },
+    });
+    assert.equal(forbiddenOtherProgramRule.status, 403, "Không được tạo rule cho chương trình ngoài phạm vi làm việc.");
+
+    const created = await request(baseUrl, "/automations", {
+      token: actorToken,
+      method: "POST",
+      body: {
+        name: `[INTEGRATION ${runId}] Automation node actions`,
+        triggerType: "lead_created",
+        institutionProgramId: fixtures.program.id,
+        graphData: automationGraph(fixtures.target.id, fixtures.targetStage.id, fixtures.customField.id, fixtures.major.id, fixtures.initialAdmissionStatus.id, fixtures.nextAdmissionStatus.id),
+      },
+    });
+    assert.equal(created.status, 201, "Actor có quyền phải tạo được rule.");
+    ruleId = created.payload.id as string;
+    createdRuleIds.push(ruleId);
+
+    const testLeadsWithoutSensitivePermission = await request(
+      baseUrl,
+      `/automations/${ruleId}/test-leads?page=1&limit=20`,
+      { token: actorToken },
+    );
+    assert.equal(testLeadsWithoutSensitivePermission.status, 200);
+    assert.ok(
+      testLeadsWithoutSensitivePermission.payload.data.every((lead: JsonRecord) => lead.phone === null),
+      "Danh sách Lead chạy thử phải ẩn số điện thoại khi thiếu lead.sensitive.view.",
+    );
+
+    const options = await request(baseUrl, `/automations/options?institutionProgramId=${fixtures.program.id}`, { token: actorToken });
+    assert.equal(options.status, 200);
+    assert.ok(
+      options.payload.customDataFields.some((field: JsonRecord) => field.reference === `custom:${fixtures.customField.id}`),
+      "Options phải trả trường dữ liệu tùy chỉnh đang hoạt động cho builder.",
+    );
+    assert.ok(
+      options.payload.registry.nodes.some((node: JsonRecord) => node.type === "action_assign"),
+      "Options phải trả node registry để builder dựng palette và properties panel.",
+    );
+    assert.ok(
+      options.payload.assignees.some((assignee: JsonRecord) => assignee.id === fixtures.actor.id),
+      "Danh sách gán trực tiếp phải giữ người dùng có quyền rộng hơn Telesale.",
+    );
+    assert.ok(
+      options.payload.assignmentPoolAssignees.some((assignee: JsonRecord) => assignee.id === fixtures.actor.id && assignee.canReceiveLead === false),
+      "Danh sách hiển thị nhân viên toàn chương trình nhưng không tự cấp quyền nhận Lead.",
+    );
+    const targetAssigneeBefore = options.payload.assignmentPoolAssignees.find((assignee: JsonRecord) => assignee.id === fixtures.target.id);
+    assert.ok(targetAssigneeBefore, "Options phải trả Sale đủ điều kiện trong chương trình làm việc.");
+    const targetAssignedCountBefore = Number(targetAssigneeBefore.assignedCount);
+    assert.ok(Number.isInteger(targetAssignedCountBefore), "Số Lead đã gán phải là số nguyên.");
+    const filteredRules = await request(
+      baseUrl,
+      `/automations?search=${runId}&isActive=false&triggerType=lead_created&page=1&limit=20`,
+      { token: actorToken },
+    );
+    assert.equal(filteredRules.status, 200);
+    assert.equal(filteredRules.payload.pagination.total, 1, "Bộ lọc rule phải kết hợp từ khóa, trạng thái và trigger phía server.");
+
+    const validation = await request(baseUrl, `/automations/${ruleId}/validate`, {
+      token: actorToken,
+      method: "POST",
+      body: {},
+    });
+    assert.equal(validation.status, 200, `Graph đầy đủ phải hợp lệ: ${JSON.stringify(validation.payload)}`);
+    assert.equal(validation.payload.valid, true);
+
+    const duplicated = await request(baseUrl, `/automations/${ruleId}/duplicate`, {
+      token: actorToken,
+      method: "POST",
+      body: {},
+    });
+    assert.equal(duplicated.status, 201, "Rule trong phạm vi phải nhân bản được.");
+    createdRuleIds.push(duplicated.payload.id as string);
+    assert.equal(duplicated.payload.version, 1);
+    const duplicatedDetail = await request(baseUrl, `/automations/${duplicated.payload.id}`, { token: actorToken });
+    assert.equal(duplicatedDetail.status, 200);
+    assert.equal(duplicatedDetail.payload.isActive, false, "Bản sao phải luôn ở trạng thái tắt.");
+    assert.deepEqual(duplicatedDetail.payload.graphData, automationGraph(fixtures.target.id, fixtures.targetStage.id, fixtures.customField.id, fixtures.major.id, fixtures.initialAdmissionStatus.id, fixtures.nextAdmissionStatus.id));
+    assert.equal(
+      (await request(baseUrl, `/automations/${duplicated.payload.id}`, { token: actorToken, method: "DELETE" })).status,
+      200,
+      "Bản sao chưa bật phải lưu trữ được.",
+    );
+
+    const activation = await request(baseUrl, `/automations/${ruleId}/toggle`, {
+      token: actorToken,
+      method: "PATCH",
+      body: { isActive: true },
+    });
+    assert.equal(activation.status, 200, "Rule hợp lệ phải bật được.");
+    assert.equal(activation.payload.isActive, true, "API bật rule phải trả hợp đồng camelCase.");
+
+    const outOfScopeRun = await request(baseUrl, `/automations/${ruleId}/test-run`, {
+      token: scopedToken,
+      method: "POST",
+      body: { leadId: fixtures.matchingLead.id },
+    });
+    assert.equal(outOfScopeRun.status, 404, "Actor ngoài scope không được chạy rule với Lead chưa được phân công.");
+
+    const matchingRun = await request(baseUrl, `/automations/${ruleId}/test-run`, {
+      token: actorToken,
+      method: "POST",
+      body: { leadId: fixtures.matchingLead.id },
+    });
+    assert.equal(matchingRun.status, 202, "Lead khớp điều kiện phải được nhận chạy thử.");
+    const matchingExecution = await waitForExecution(baseUrl, actorToken, matchingRun.payload.executionId);
+    assert.equal(matchingExecution.status, "completed");
+    // Conversion does not grant student visibility implicitly. The positive fixture
+    // needs student.view for its following template; the same read without it stays denied.
+    const { getAutomationLeadData } = await import("../modules/automations/automation-data-field.service.js");
+    assert.equal(await getAutomationLeadData({ ...programScopedActor, permissions: programScopedActor.permissions.filter((permission) => permission !== "student.view") }, fixtures.matchingLead.id, fixtures.program.id, ["system:fullName"]), null);
+    assert.ok(await getAutomationLeadData(programScopedActor, fixtures.matchingLead.id, fixtures.program.id, ["system:fullName"]));
+    assert.equal(matchingExecution.source, "manual_test");
+    assert.deepEqual(
+      matchingExecution.nodes.map((node: JsonRecord) => node.nodeId).sort(),
+      [
+        "activity",
+        "assign",
+        "condition",
+        "convert_student",
+        "create_admission",
+        "notification",
+        "request_document",
+        "stage",
+        "update_admission",
+      ],
+      "Nhánh đúng phải chạy đủ action và không chạy delay.",
+    );
+    assert.ok(matchingExecution.nodes.every((node: JsonRecord) => node.status === "completed" && node.attemptCount === 1));
+
+    const matchingLead = await request(baseUrl, `/leads/${fixtures.matchingLead.id}`, { token: actorToken });
+    assert.equal(matchingLead.status, 200);
+    assert.equal(matchingLead.payload.data.assignments[0]?.assignee?.id, fixtures.target.id, "Action assign phải đổi người phụ trách.");
+    const optionsAfterAssignment = await request(
+      baseUrl,
+      `/automations/options?institutionProgramId=${fixtures.program.id}`,
+      { token: actorToken },
+    );
+    assert.equal(optionsAfterAssignment.status, 200);
+    const targetAssigneeAfter = optionsAfterAssignment.payload.assignmentPoolAssignees.find((assignee: JsonRecord) => assignee.id === fixtures.target.id);
+    assert.equal(
+      Number(targetAssigneeAfter?.assignedCount),
+      targetAssignedCountBefore + 1,
+      "Cột Đã gán phải phản ánh số Lead hiện do Sale phụ trách trong chương trình làm việc.",
+    );
+    assert.equal(matchingLead.payload.data.stageHistory[0]?.toStage?.id, fixtures.targetStage.id, "Action stage phải ghi lịch sử pipeline.");
+    assert.equal(
+      matchingLead.payload.data.activities.filter((activity: JsonRecord) => activity.type === "lead_assigned").length,
+      1,
+      "Action assign phải ghi timeline activity.",
+    );
+    assert.equal(
+      matchingLead.payload.data.activities.filter((activity: JsonRecord) => activity.type === "pipeline_stage_changed").length,
+      1,
+      "Action stage phải ghi timeline activity.",
+    );
+    assert.equal(
+      matchingLead.payload.data.activities.filter((activity: JsonRecord) => activity.content === `${activityContent} ${matchingLeadName}`).length,
+      1,
+      "Action activity phải chỉ ghi đúng một lần.",
+    );
+
+    const admissionProfile = await prisma.admission_profiles.findUnique({
+      where: { lead_id: fixtures.matchingLead.id },
+      select: { id: true },
+    });
+    assert.ok(admissionProfile, "Automation must create an admission profile for the matching lead.");
+
+    const requestedDocuments = await prisma.admission_documents.findMany({
+      where: {
+        lead_id: fixtures.matchingLead.id,
+        document_type: "CCCD",
+        status: "missing",
+      },
+      select: { id: true },
+    });
+    assert.equal(requestedDocuments.length, 1, "Automation must create exactly one missing CCCD request.");
+
+    const convertedStudents = await prisma.students.findMany({
+      where: { admission_profile_id: admissionProfile.id },
+      select: { id: true, student_code: true },
+    });
+    assert.equal(convertedStudents.length, 1, "Automation must convert the admission profile exactly once.");
+    assert.ok(convertedStudents[0]?.student_code, "The converted student must have a student code.");
+
+    const targetNotifications = await request(baseUrl, "/notifications?page=1&limit=50", { token: targetToken });
+    assert.equal(targetNotifications.status, 200);
+    assert.equal(
+      targetNotifications.payload.data.filter((notification: JsonRecord) => notification.title === `${notificationTitle} ${matchingLeadName}`).length,
+      1,
+      "Action notification phải gửi đúng một thông báo tới role đích.",
+    );
+    assert.equal(
+      targetNotifications.payload.data.filter((notification: JsonRecord) => notification.type === "lead_assignment").length,
+      1,
+      "Action assign phải gửi thông báo phân công.",
+    );
+
+    const leadAudits = await request(
+      baseUrl,
+      `/audit-logs?page=1&limit=100&sortBy=createdAt&sortOrder=desc&search=${fixtures.matchingLead.id}`,
+      { token: actorToken },
+    );
+    assert.equal(leadAudits.status, 200);
+    const leadAuditActions = new Set(leadAudits.payload.data.map((audit: JsonRecord) => audit.action));
+    assert.ok(leadAuditActions.has("assign"), "Action assign phải ghi audit.");
+    assert.ok(leadAuditActions.has("pipeline_stage_changed"), "Action stage phải ghi audit.");
+    assert.ok(leadAuditActions.has("automation_activity_created"), "Action activity phải ghi audit.");
+
+    const nonMatchingRun = await request(baseUrl, `/automations/${ruleId}/test-run`, {
+      token: actorToken,
+      method: "POST",
+      body: { leadId: fixtures.nonMatchingLead.id },
+    });
+    assert.equal(nonMatchingRun.status, 202, "Lead không khớp vẫn phải chạy nhánh false.");
+    const delayedCheckpoint = await waitForDelayedCheckpoint(baseUrl, actorToken, nonMatchingRun.payload.executionId);
+    assert.equal(delayedCheckpoint.status, "processing", "Execution phải tiếp tục chờ sau khi node delay hoàn tất.");
+    assert.deepEqual(
+      delayedCheckpoint.nodes.map((node: JsonRecord) => node.nodeId).sort(),
+      ["condition", "delay"],
+      "Action sau delay không được chạy trước hạn.",
+    );
+    const nonMatchingExecution = await waitForExecution(baseUrl, actorToken, nonMatchingRun.payload.executionId);
+    assert.equal(nonMatchingExecution.status, "completed");
+    assert.deepEqual(
+      nonMatchingExecution.nodes.map((node: JsonRecord) => node.nodeId).sort(),
+      ["condition", "delay", "delayed_activity", "terminal_delay"],
+      "Nhánh false phải tiếp tục sau delay và hoàn tất tại delay terminal.",
+    );
+    assert.ok(nonMatchingExecution.nodes.every((node: JsonRecord) => node.status === "completed" && node.attemptCount === 1));
+
+    const nonMatchingLead = await request(baseUrl, `/leads/${fixtures.nonMatchingLead.id}`, { token: actorToken });
+    assert.equal(nonMatchingLead.status, 200);
+    assert.equal(nonMatchingLead.payload.data.assignments.length, 0, "Nhánh false không được phân công Lead.");
+    assert.equal(nonMatchingLead.payload.data.stageHistory.length, 0, "Nhánh false không được đổi pipeline.");
+    assert.equal(
+      nonMatchingLead.payload.data.activities.filter((activity: JsonRecord) => activity.content === `${activityContent} ${matchingLeadName}`).length,
+      0,
+      "Nhánh false không được ghi activity của nhánh đúng.",
+    );
+    assert.equal(
+      nonMatchingLead.payload.data.activities.filter((activity: JsonRecord) => activity.content === delayedActivityContent).length,
+      1,
+      "Action sau delay phải chạy đúng một lần sau hạn.",
+    );
+
+    const logs = await request(baseUrl, `/automations/${ruleId}/logs?page=1&limit=20`, { token: actorToken });
+    assert.equal(logs.status, 200);
+    assert.equal(logs.payload.pagination.total, 2, "Rule phải có đủ hai execution quan sát được qua API.");
+    assert.ok(logs.payload.data.every((log: JsonRecord) => log.status === "completed" && log.version === 1));
+    assert.ok(
+      logs.payload.data.every((log: JsonRecord) => log.executionActorId === fixtures.actor.id),
+      "Execution phải ghi nhận chủ sở hữu rule là danh tính thực thi.",
+    );
+
+    const deactivation = await request(baseUrl, `/automations/${ruleId}/toggle`, {
+      method: "PATCH",
+      token: actorToken,
+      body: { isActive: false },
+    });
+    assert.equal(deactivation.status, 200, "Phải tắt được rule trước khi lưu trữ.");
+
+    const archived = await request(baseUrl, `/automations/${ruleId}`, { method: "DELETE", token: actorToken });
+    assert.equal(archived.status, 200, "Rule đã tắt phải lưu trữ được.");
+    assert.equal(archived.payload.message, "Đã lưu trữ automation rule.");
+
+    const listAfterArchive = await request(baseUrl, `/automations?search=${runId}&page=1&limit=20`, { token: actorToken });
+    assert.equal(listAfterArchive.status, 200);
+    assert.equal(listAfterArchive.payload.pagination.total, 0, "Rule lưu trữ không còn xuất hiện trong danh sách.");
+    const logsAfterArchive = await request(baseUrl, `/automations/${ruleId}/logs?page=1&limit=20`, { token: actorToken });
+    assert.equal(logsAfterArchive.status, 200, "Lịch sử rule đã lưu trữ phải còn truy cập được để tra soát.");
+    assert.equal(logsAfterArchive.payload.pagination.total, 2, "Lưu trữ rule phải giữ nguyên lịch sử thực thi.");
+
+    const eventFormId = randomUUID();
+    const eventNotificationTitle = `[G6 ${runId}] Khảo sát không Lead`;
+    const eventGraph = {
+      nodes: [
+        { id: "trigger", type: "trigger" as const, position: { x: 0, y: 0 }, data: { label: "Khảo sát hoàn thành", triggerType: "survey_completed" } },
+        { id: "condition", type: "condition" as const, position: { x: 200, y: 0 }, data: { label: "Đúng form và đáp án", conditionCombinator: "AND" as const, conditions: [
+          { field: "event:formId", operator: "equals", value: eventFormId },
+          { field: "event:answer:satisfaction", operator: "equals", value: "5" },
+        ] } },
+        { id: "notification", type: "action_notification" as const, position: { x: 400, y: 0 }, data: { label: "Thông báo nội bộ", title: eventNotificationTitle, content: "Có phản hồi khảo sát mới.", targetRole: targetRoleCode } },
+      ],
+      edges: [
+        { id: "t-c", source: "trigger", target: "condition" },
+        { id: "c-n", source: "condition", target: "notification", sourceHandle: "default" },
+      ],
+    };
+    const eventRule = await prisma.automation_rules.create({ data: {
+      name: `[G6 ${runId}] Survey event`, trigger_type: "survey_completed", institution_program_id: fixtures.program.id, is_active: true,
+      created_by: fixtures.actor.id, graph_data: eventGraph,
+    } });
+    createdRuleIds.push(eventRule.id);
+    const eventId = randomUUID();
+    const { automationEventExecutionId } = await import("../modules/automations/automation-event-id.js");
+    const executionId = automationEventExecutionId(eventId, eventRule.id);
+    const eventContext = { institutionProgramId: fixtures.program.id, marketingFormSubmissionId: eventId, marketingFormId: eventFormId,
+      payload: { formId: eventFormId, answers: { satisfaction: "5" } } };
+    const executableRule = { id: eventRule.id, version: eventRule.version, triggerType: "survey_completed", graphData: eventGraph,
+      institutionProgramId: fixtures.program.id, createdBy: fixtures.actor.id };
+    const firstEvent = await engine.startAutomationExecution(executableRule, eventContext, "event", null, undefined, executionId, true);
+    assert.ok(firstEvent.ok);
+    for (let attempt = 0; attempt < 150; attempt += 1) {
+      const execution = await prisma.automation_execution_logs.findUniqueOrThrow({ where: { id: executionId } });
+      if (execution.status === "completed" || execution.status === "failed") break;
+      await new Promise((resolve) => setTimeout(resolve, 100));
+    }
+    assert.equal((await prisma.automation_execution_logs.findUniqueOrThrow({ where: { id: executionId } })).status, "completed");
+    const replayEvent = await engine.startAutomationExecution(executableRule, eventContext, "event", null, undefined, executionId, true);
+    assert.ok(replayEvent.ok && !replayEvent.data.created);
+    assert.equal(await prisma.notifications.count({ where: { title: eventNotificationTitle } }), 1, "Một event không Lead phải chỉ tạo một thông báo qua Redis worker.");
+    assert.equal(await prisma.automation_execution_logs.count({ where: { id: executionId } }), 1);
+    const { createMarketingFormAutomationEvent, dispatchMarketingFormAutomationEvent, recoverMarketingFormAutomationEvents } = await import("../modules/automations/marketing-form-automation-event.service.js");
+    formEventJobIds.push(eventId);
+    await prisma.$transaction((tx) => createMarketingFormAutomationEvent(tx, {
+      triggerType: "survey_completed", submissionId: eventId, formId: eventFormId, institutionProgramId: fixtures.program.id,
+      configurationVersion: "fixture-v1", leadId: null, actorId: fixtures.actor.id, answers: { satisfaction: "5" },
+    }));
+    const outage = await dispatchMarketingFormAutomationEvent(eventId, async () => ({ matched: 1, started: 0, failed: 0, unavailable: true }));
+    assert.equal(outage.ok, false);
+    await prisma.automation_jobs.update({ where: { id: eventId }, data: { run_at: new Date(Date.now() - 1000) } });
+    const recoveredEvent = await recoverMarketingFormAutomationEvents(1, async (_trigger, context, options) => {
+      const restarted = await engine.startAutomationExecution(executableRule, context, "event", null, undefined,
+        automationEventExecutionId(options.eventId, eventRule.id), options.retryFailedExecutions);
+      return { matched: 1, started: restarted.ok ? 1 : 0, failed: restarted.ok ? 0 : 1, unavailable: false };
+    }, [eventId]);
+    assert.deepEqual(recoveredEvent, { scanned: 1, completed: 1 });
+    assert.equal((await prisma.automation_jobs.findUniqueOrThrow({ where: { id: eventId } })).status, "completed");
+    assert.equal(await prisma.notifications.count({ where: { title: eventNotificationTitle } }), 1, "Recovery sau mất ACK không được chạy lại action đã hoàn tất.");
+    const { executeRegisteredAutomationNode } = await import("../modules/automations/automation-action-registry.js");
+    const authenticatedEventContext = { ...eventContext, ruleId: eventRule.id, actorId: fixtures.actor.id };
+    await assert.rejects(executeRegisteredAutomationNode({ id: "assign", type: "action_assign", position: { x: 0, y: 0 },
+      data: { label: "Phân công", assignToUserId: fixtures.target.id } }, authenticatedEventContext, randomUUID()), /thiếu nhân viên hoặc lead context/);
+    await assert.rejects(executeRegisteredAutomationNode(eventGraph.nodes[1], {
+      ...authenticatedEventContext, institutionProgramId: randomUUID(),
+    }, randomUUID()), /không còn quyền automation/);
+    const assignmentLog = await prisma.automation_execution_logs.create({ data: {
+      rule_id: eventRule.id, status: "processing", execution_actor_id: fixtures.actor.id,
+    } });
+    const assignmentNode = await prisma.automation_node_executions.create({ data: {
+      execution_log_id: assignmentLog.id, node_id: "preserve-assignment", node_type: "action_assign_pool",
+    } });
+    const assignmentsBefore = await prisma.lead_assignments.count({ where: { lead_id: fixtures.matchingLead.id } });
+    await executeRegisteredAutomationNode({ id: "preserve-assignment", type: "action_assign_pool", position: { x: 0, y: 0 },
+      data: { label: "Giữ Sale hiện tại", assignmentStrategy: "round_robin", assigneeIds: [fixtures.target.id] } },
+    { ...authenticatedEventContext, leadId: fixtures.matchingLead.id }, assignmentNode.id);
+    assert.equal(await prisma.lead_assignments.count({ where: { lead_id: fixtures.matchingLead.id } }), assignmentsBefore);
+    assert.ok((await prisma.automation_node_executions.findUniqueOrThrow({ where: { id: assignmentNode.id } })).action_completed_at,
+      "Giữ Sale hiện tại vẫn phải hoàn tất node, không treo execution khi retry.");
+    console.log("Automation integration passed: API, RBAC, archive, Redis worker, branching, action nodes and idempotent no-Lead Form/Survey events verified.");
+  } finally {
+    await prisma.automation_jobs.deleteMany({ where: { id: { in: formEventJobIds } } });
+    server.closeAllConnections();
+    await new Promise<void>((resolve) => server.close(() => resolve()));
+    await engine.automationQueue?.obliterate({ force: true });
+    await engine.closeAutomationEngine();
+    await getWebhookQueueAdapter()?.close?.();
+    await redisCommandConnection?.quit();
+    await redisConnection?.quit();
+    await cleanup();
+    await prisma.$disconnect();
+  }
+}
+
+main()
+  .then(() => process.exit(0))
+  .catch((error: unknown) => {
+    console.error(error);
+    process.exit(1);
+  });

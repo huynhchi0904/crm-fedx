@@ -1,0 +1,408 @@
+import * as XLSX from "xlsx";
+
+import type { AuthUser } from "../auth/auth.types";
+import { createLead } from "./application/create-lead.use-case";
+import { createLeadInTransaction } from "./application/create-lead.use-case";
+import { importTransaction } from "./import-transaction";
+import { getPreference } from "../system/system-preferences.service";
+import { leadPhoneDuplicateWhere } from "./application/lead-mutation-support";
+import type { LeadInput } from "./domain/lead-input";
+import { prisma } from "../../database/prisma";
+import { readBizflyRows, importBizflyRows } from "./bizfly-lead-import.service";
+
+type ImportRow = Record<string, unknown>;
+
+export type LeadImportError = {
+  row: number;
+  fullName: string | null;
+  phone: string | null;
+  message: string;
+};
+
+export type LeadImportResult = {
+  preview?: boolean;
+  totalRows: number;
+  importedRows: number;
+  /** Existing leads (same phone in the program) whose imported values changed. */
+  updatedRows: number;
+  /** Existing leads whose imported values already matched. */
+  unchangedRows: number;
+  failedRows: number;
+  errors: LeadImportError[];
+};
+
+type ReferenceMaps = {
+  sourcesById: Map<string, string>;
+  sourcesByName: Map<string, string>;
+  stagesById: Map<string, string>;
+  stagesByName: Map<string, string>;
+  programsById: Map<string, string>;
+  programsByCode: Map<string, string>;
+  programsByName: Map<string, string>;
+  majorsById: Map<string, string>;
+  majorsByCode: Map<string, string>;
+  majorsByName: Map<string, string>;
+  admissionStatusesById: Map<string, string>;
+  admissionStatusesByCode: Map<string, string>;
+  admissionStatusesByName: Map<string, string>;
+};
+
+const maxRows = 1000;
+const headerAliases: Record<string, keyof LeadInput | "sourceName" | "stageName" | "programCode" | "programName" | "majorCode" | "majorName" | "admissionStatusCode" | "admissionStatusName"> = {
+  fullname: "fullName",
+  hoten: "fullName",
+  hovaten: "fullName",
+  tenungvien: "fullName",
+  phone: "phone",
+  sodienthoai: "phone",
+  dienthoai: "phone",
+  sdt: "phone",
+  email: "email",
+  sourceid: "sourceId",
+  nguonid: "sourceId",
+  sourcename: "sourceName",
+  nguonlead: "sourceName",
+  pipeline_stage_id: "pipelineStageId",
+  pipelinestageid: "pipelineStageId",
+  stageid: "pipelineStageId",
+  tientrinhid: "pipelineStageId",
+  stagename: "stageName",
+  tientrinh: "stageName",
+  note: "note",
+  ghichu: "note",
+  gender: "gender",
+  gioitinh: "gender",
+  dateofbirth: "dateOfBirth",
+  ngaysinh: "dateOfBirth",
+  cccd: "cccd",
+  birthplace: "birthPlace",
+  noisinh: "birthPlace",
+  nationality: "nationality",
+  quoctich: "nationality",
+  ethnicity: "ethnicity",
+  dantoc: "ethnicity",
+  religion: "religion",
+  tongiao: "religion",
+  graduationyear: "graduationYear",
+  namtotnghiep: "graduationYear",
+  highschoolname: "highSchoolName",
+  truongthpt: "highSchoolName",
+  province: "province",
+  tinh: "province",
+  district: "district",
+  huyen: "district",
+  ward: "ward",
+  xa: "ward",
+  specificaddress: "specificAddress",
+  diachicuthe: "specificAddress",
+  institutionprogramid: "institutionProgramId",
+  programid: "institutionProgramId",
+  chuongtrinhid: "institutionProgramId",
+  programcode: "programCode",
+  machuongtrinh: "programCode",
+  programname: "programName",
+  chuongtrinh: "programName",
+  majorid: "majorId",
+  nganhid: "majorId",
+  majorcode: "majorCode",
+  manganh: "majorCode",
+  majorname: "majorName",
+  nganh: "majorName",
+  admissionstatusid: "admissionStatusId",
+  trangthaihosoid: "admissionStatusId",
+  admissionstatuscode: "admissionStatusCode",
+  matrangthaihoso: "admissionStatusCode",
+  admissionstatusname: "admissionStatusName",
+  trangthaihoso: "admissionStatusName",
+  trainingcode: "trainingCode",
+  madt: "trainingCode",
+  classcode: "classCode",
+  malop: "classCode",
+  subjectgroupcode: "subjectGroupCode",
+  matohopmon: "subjectGroupCode",
+  subjectgroupname: "subjectGroupName",
+  tentohopmon: "subjectGroupName",
+  score1: "score1",
+  diem1: "score1",
+  score2: "score2",
+  diem2: "score2",
+  score3: "score3",
+  diem3: "score3",
+  admissionscore: "admissionScore",
+  diemxettuyen: "admissionScore",
+  monthlyrevenue: "monthlyRevenue",
+  doanhthuthang: "monthlyRevenue",
+  doanhsothang: "monthlyRevenue",
+  gclid: "gclid",
+  tags: "tags",
+};
+
+export class InvalidLeadImportFileError extends Error {}
+
+export async function importLeadsFromWorkbook(
+  user: AuthUser,
+  file: Buffer,
+  scopedInstitutionProgramId?: string,
+  ipAddress?: string,
+  options: { preview?: boolean } = {},
+): Promise<LeadImportResult> {
+  const intake = await getPreference(scopedInstitutionProgramId, "intake");
+  const bizflyRows = readBizflyRows(file);
+  if (bizflyRows) return importBizflyRows(user, bizflyRows, scopedInstitutionProgramId, ipAddress, prisma, { preview: options.preview, duplicatePolicy: intake.bizflyDuplicate });
+  const { headers, rows } = readRows(file);
+  validateRequiredHeaders(headers, Boolean(scopedInstitutionProgramId));
+  const referenceMaps = await getReferenceMaps(scopedInstitutionProgramId);
+  const errors: LeadImportError[] = [];
+  let importedRows = 0;
+  let unchangedRows = 0;
+  const previewPhones = new Set<string>();
+
+  for (const [index, row] of rows.entries()) {
+    const rowNumber = index + 2;
+    const mapped = mapRow(row);
+    const normalized = normalizeInput(mapped, referenceMaps, scopedInstitutionProgramId);
+    if (!normalized.ok) {
+      errors.push({ row: rowNumber, fullName: asText(mapped.fullName) ?? null, phone: asText(mapped.phone) ?? null, message: normalized.message });
+      continue;
+    }
+
+    if (!normalized.input.institutionProgramId || !user.institutionProgramIds.includes(normalized.input.institutionProgramId)) {
+      errors.push({ row: rowNumber, fullName: normalized.input.fullName, phone: normalized.input.phone, message: "Bạn không có quyền nhập lead vào chương trình này." });
+      continue;
+    }
+    const rowIntake = normalized.input.institutionProgramId === scopedInstitutionProgramId ? intake : await getPreference(normalized.input.institutionProgramId, "intake");
+    const phoneKey = `${normalized.input.institutionProgramId}:${normalized.input.phone}`;
+    const duplicate = await prisma.leads.findFirst({ where: { ...leadPhoneDuplicateWhere(normalized.input), institution_program_id: normalized.input.institutionProgramId, deleted_at: null }, select: { id: true } });
+    if ((duplicate || previewPhones.has(phoneKey)) && rowIntake.excelDuplicate === "skip") { unchangedRows++; continue; }
+    if (previewPhones.has(phoneKey)) {
+      errors.push({ row: rowNumber, fullName: normalized.input.fullName, phone: normalized.input.phone, message: "Số điện thoại lặp trong file nhập." });
+      continue;
+    }
+    try {
+    const result = options.preview
+      ? await importTransaction(prisma, tx => createLeadInTransaction(tx, user, normalized.input, { ipAddress, creationSource: { channel: "import" } }), true)
+      : await createLead(user, normalized.input, ipAddress, { channel: "import" });
+    if (!result.ok) {
+      errors.push({
+        row: rowNumber,
+        fullName: normalized.input.fullName,
+        phone: normalized.input.phone,
+        message: resultMessage(result.reason),
+      });
+      continue;
+    }
+    importedRows += 1;
+    if (options.preview) previewPhones.add(phoneKey);
+    } catch (error) {
+      errors.push({ row: rowNumber, fullName: normalized.input.fullName, phone: normalized.input.phone, message: error instanceof Error ? error.message : "Không thể nhập dòng dữ liệu này." });
+    }
+  }
+
+  return {
+    totalRows: rows.length,
+    importedRows,
+    updatedRows: 0,
+    unchangedRows,
+    preview: options.preview ?? false,
+    failedRows: errors.length,
+    errors,
+  };
+}
+
+function readRows(file: Buffer) {
+  let workbook: XLSX.WorkBook;
+  try {
+    workbook = XLSX.read(file, { type: "buffer", cellDates: true });
+  } catch {
+    throw new InvalidLeadImportFileError("Không thể đọc file Excel. Vui lòng kiểm tra định dạng .xlsx hoặc .xls.");
+  }
+  const sheetName = workbook.SheetNames[0];
+  if (!sheetName) throw new InvalidLeadImportFileError("File Excel không có trang dữ liệu.");
+  const worksheet = workbook.Sheets[sheetName];
+  const rawRows = XLSX.utils.sheet_to_json<unknown[]>(worksheet, { header: 1, defval: "", blankrows: false });
+  const headers = (rawRows[0] ?? []).map((value) => String(value).trim()).filter(Boolean);
+  const rows = XLSX.utils.sheet_to_json<ImportRow>(worksheet, { defval: "" });
+  if (headers.length === 0) throw new InvalidLeadImportFileError("File Excel chưa có hàng tiêu đề.");
+  if (rows.length === 0) throw new InvalidLeadImportFileError("File Excel chưa có dòng dữ liệu lead.");
+  if (rows.length > maxRows) throw new InvalidLeadImportFileError(`File chỉ hỗ trợ tối đa ${maxRows} dòng mỗi lần nhập.`);
+  return { headers, rows };
+}
+
+function validateRequiredHeaders(headers: string[], hasScopedInstitutionProgram: boolean) {
+  const mappedHeaders = new Set(headers.flatMap((header) => {
+    const field = headerAliases[normalizeHeader(header)];
+    return field ? [field] : [];
+  }));
+  const missing: string[] = [];
+  if (!mappedHeaders.has("fullName")) missing.push("fullName");
+  if (!mappedHeaders.has("phone")) missing.push("phone");
+  if (!mappedHeaders.has("sourceId") && !mappedHeaders.has("sourceName")) missing.push("sourceId hoặc sourceName");
+  if (!hasScopedInstitutionProgram
+    && !mappedHeaders.has("institutionProgramId")
+    && !mappedHeaders.has("programCode")
+    && !mappedHeaders.has("programName")) {
+    missing.push("institutionProgramId, programCode hoặc programName");
+  }
+  if (missing.length > 0) {
+    throw new InvalidLeadImportFileError(`Thiếu cột bắt buộc: ${missing.join(", ")}. Các cột khác là tùy chọn.`);
+  }
+}
+
+async function getReferenceMaps(scopedInstitutionProgramId?: string): Promise<ReferenceMaps> {
+  const [sources, stages, programs, majors, admissionStatuses] = await prisma.$transaction([
+    prisma.lead_sources.findMany({
+      where: scopedInstitutionProgramId ? { institution_program_id: scopedInstitutionProgramId } : { institution_program_id: { not: null } },
+      select: { id: true, name: true },
+    }),
+    prisma.pipeline_stages.findMany({ select: { id: true, name: true } }),
+    prisma.institution_programs.findMany({
+      where: scopedInstitutionProgramId ? { id: scopedInstitutionProgramId } : { status: "active" },
+      select: { id: true, code: true, name: true },
+    }),
+    prisma.majors.findMany({
+      where: scopedInstitutionProgramId ? { OR: [{ institution_program_id: scopedInstitutionProgramId }, { institution_program_id: null }] } : undefined,
+      select: { id: true, code: true, name: true },
+    }),
+    prisma.admission_statuses.findMany({ select: { id: true, code: true, name: true } }),
+  ]);
+
+  return {
+    sourcesById: mapBy(sources, "id"),
+    sourcesByName: mapBy(sources, "name"),
+    stagesById: mapBy(stages, "id"),
+    stagesByName: mapBy(stages, "name"),
+    programsById: mapBy(programs, "id"),
+    programsByCode: mapBy(programs, "code"),
+    programsByName: mapBy(programs, "name"),
+    majorsById: mapBy(majors, "id"),
+    majorsByCode: mapBy(majors, "code"),
+    majorsByName: mapBy(majors, "name"),
+    admissionStatusesById: mapBy(admissionStatuses, "id"),
+    admissionStatusesByCode: mapBy(admissionStatuses, "code"),
+    admissionStatusesByName: mapBy(admissionStatuses, "name"),
+  };
+}
+
+function mapBy<T extends { id: string }, K extends keyof T>(items: T[], key: K) {
+  const map = new Map<string, string>();
+  for (const item of items) {
+    const value = item[key];
+    if (typeof value === "string" && value.trim()) {
+      map.set(normalizeKey(value), item.id);
+    }
+  }
+  return map;
+}
+
+function mapRow(row: ImportRow) {
+  const mapped: Record<string, string> = {};
+  for (const [header, value] of Object.entries(row)) {
+    const key = headerAliases[normalizeHeader(header)];
+    if (key) mapped[key] = asText(value) ?? "";
+  }
+  return mapped;
+}
+
+function normalizeInput(mapped: Record<string, string>, references: ReferenceMaps, scopedInstitutionProgramId?: string) {
+  const fullName = asText(mapped.fullName);
+  const phoneDigits = asText(mapped.phone)?.replace(/\D/g, "");
+  const phone = phoneDigits?.length === 9 ? `0${phoneDigits}` : phoneDigits;
+  const sourceId = resolveReference(mapped.sourceId, references.sourcesById)
+    ?? resolveReference(mapped.sourceName, references.sourcesByName);
+  const pipelineStageId = resolveReference(mapped.pipelineStageId, references.stagesById)
+    ?? resolveReference(mapped.stageName, references.stagesByName)
+    ?? undefined;
+  const institutionProgramId = scopedInstitutionProgramId
+    ?? resolveReference(mapped.institutionProgramId, references.programsById)
+    ?? resolveReference(mapped.programCode, references.programsByCode)
+    ?? resolveReference(mapped.programName, references.programsByName)
+    ?? undefined;
+  const majorId = resolveReference(mapped.majorId, references.majorsById)
+    ?? resolveReference(mapped.majorCode, references.majorsByCode)
+    ?? resolveReference(mapped.majorName, references.majorsByName)
+    ?? undefined;
+  const admissionStatusId = resolveReference(mapped.admissionStatusId, references.admissionStatusesById)
+    ?? resolveReference(mapped.admissionStatusCode, references.admissionStatusesByCode)
+    ?? resolveReference(mapped.admissionStatusName, references.admissionStatusesByName)
+    ?? undefined;
+
+  if (!fullName || fullName.length < 2) return { ok: false as const, message: "Thiếu họ tên hoặc họ tên quá ngắn." };
+  if (!phone || !/^\d{10}$/.test(phone)) return { ok: false as const, message: "Số điện thoại phải gồm đúng 10 chữ số." };
+  if (!sourceId) return { ok: false as const, message: "Không tìm thấy nguồn lead. Dùng sourceId hoặc sourceName hợp lệ." };
+  if (!institutionProgramId) return { ok: false as const, message: "Không tìm thấy chương trình tuyển sinh. Hãy chọn chương trình đang làm việc hoặc thêm cột chương trình hợp lệ." };
+
+  const input: LeadInput = {
+    fullName,
+    phone,
+    sourceId,
+    pipelineStageId,
+    email: asText(mapped.email),
+    gender: asText(mapped.gender),
+    dateOfBirth: normalizeDate(mapped.dateOfBirth),
+    cccd: asText(mapped.cccd),
+    note: asText(mapped.note),
+    birthPlace: asText(mapped.birthPlace),
+    nationality: asText(mapped.nationality),
+    ethnicity: asText(mapped.ethnicity),
+    religion: asText(mapped.religion),
+    graduationYear: asText(mapped.graduationYear),
+    highSchoolName: asText(mapped.highSchoolName),
+    province: asText(mapped.province),
+    district: asText(mapped.district),
+    ward: asText(mapped.ward),
+    specificAddress: asText(mapped.specificAddress),
+    institutionProgramId,
+    majorId,
+    admissionStatusId,
+    trainingCode: asText(mapped.trainingCode),
+    classCode: asText(mapped.classCode),
+    subjectGroupCode: asText(mapped.subjectGroupCode),
+    subjectGroupName: asText(mapped.subjectGroupName),
+    score1: normalizeDecimal(mapped.score1),
+    score2: normalizeDecimal(mapped.score2),
+    score3: normalizeDecimal(mapped.score3),
+    admissionScore: normalizeDecimal(mapped.admissionScore),
+    monthlyRevenue: normalizeDate(mapped.monthlyRevenue),
+    gclid: asText(mapped.gclid),
+    tags: asText(mapped.tags),
+  };
+  return { ok: true as const, input };
+}
+
+function resolveReference(value: string | undefined, map: Map<string, string>) {
+  const text = asText(value);
+  return text ? map.get(normalizeKey(text)) : undefined;
+}
+
+function normalizeHeader(value: string) {
+  return normalizeKey(value).replace(/[^a-z0-9_]/g, "");
+}
+
+function normalizeKey(value: string) {
+  return value.trim().toLowerCase().normalize("NFD").replace(/[\u0300-\u036f]/g, "").replace(/\s+/g, "");
+}
+
+function asText(value: unknown) {
+  if (value === null || value === undefined) return undefined;
+  const text = value instanceof Date ? value.toISOString().slice(0, 10) : String(value).trim();
+  return text || undefined;
+}
+
+function normalizeDate(value: unknown) {
+  const text = asText(value);
+  if (!text) return undefined;
+  const date = new Date(text);
+  return Number.isNaN(date.getTime()) ? undefined : date.toISOString().slice(0, 10);
+}
+
+function normalizeDecimal(value: unknown) {
+  const text = asText(value)?.replace(",", ".");
+  return text && /^\d+(\.\d{1,2})?$/.test(text) ? text : undefined;
+}
+
+function resultMessage(reason: string) {
+  if (reason === "phone_already_exists") return "Số điện thoại đã tồn tại trong danh sách lead.";
+  if (reason === "source_not_found") return "Nguồn học viên không tồn tại.";
+  if (reason === "stage_not_found") return "Tiến trình đã chọn không tồn tại.";
+  return "Ngành đăng ký hoặc trạng thái hồ sơ không tồn tại.";
+}

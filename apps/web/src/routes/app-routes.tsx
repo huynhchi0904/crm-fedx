@@ -1,0 +1,460 @@
+import { lazy, Suspense } from "react";
+import { Navigate, Route, Routes } from "react-router-dom";
+
+import { MainLayout } from "@/components/layout/main-layout";
+import { RouteLoadingState } from "./route-loading-state";
+import { LoginPage } from "@/modules/auth/pages/login-page";
+import { WorkspacePage } from "@/modules/dashboard/pages/workspace-page";
+import { ForbiddenPage } from "@/pages/forbidden-page";
+import { ProtectedRoute } from "./protected-route";
+
+const ReleasesPage = lazy(() => import("@/modules/management/pages/releases-page").then(module => ({ default: module.ReleasesPage })));
+
+const UsersAccessPage = lazy(() =>
+  import("@/modules/management/pages/users-access-page").then((module) => ({
+    default: module.UsersAccessPage,
+  })),
+);
+const RolesAccessPage = lazy(() =>
+  import("@/modules/management/pages/roles-access-page").then((module) => ({
+    default: module.RolesAccessPage,
+  })),
+);
+const PermissionsAccessPage = lazy(() =>
+  import("@/modules/management/pages/permissions-access-page").then((module) => ({
+    default: module.PermissionsAccessPage,
+  })),
+);
+const DepartmentsAccessPage = lazy(() =>
+  import("@/modules/management/pages/departments-access-page").then((module) => ({
+    default: module.DepartmentsAccessPage,
+  })),
+);
+const PipelinesAccessPage = lazy(() =>
+  import("@/modules/management/pages/pipelines-access-page").then((module) => ({
+    default: module.PipelinesAccessPage,
+  })),
+);
+const SystemSettingsPage = lazy(() =>
+  import("@/modules/management/pages/system-preferences-page").then((module) => ({
+    default: module.SystemSettingsPage,
+  })),
+);
+const DisplayLayoutsPage = lazy(() =>
+  import("@/modules/management/pages/display-layouts-page").then(module => ({ default: module.DisplayLayoutsPage })),
+);
+const WebhooksPage = lazy(() =>
+  import("@/modules/webhooks/pages/webhooks-page").then((module) => ({
+    default: module.WebhooksPage,
+  })),
+);
+const InstitutionProgramsManagementPage = lazy(() =>
+  import("@/modules/institutions/pages/institution-programs-management-page").then((module) => ({
+    default: module.InstitutionProgramsManagementPage,
+  })),
+);
+const LeadsListPage = lazy(() =>
+  import("@/modules/leads/pages/leads-list-page").then((module) => ({
+    default: module.LeadsListPage,
+  })),
+);
+const LeadDetailPage = lazy(() =>
+  import("@/modules/leads/pages/lead-detail-page").then((module) => ({
+    default: module.LeadDetailPage,
+  })),
+);
+const LeadAssignmentsPage = lazy(() =>
+  import("@/modules/sale/pages/lead-assignments-page").then((module) => ({
+    default: module.LeadAssignmentsPage,
+  })),
+);
+const CustomerLookupPage = lazy(() =>
+  import("@/modules/sale/pages/customer-lookup-page").then((module) => ({
+    default: module.CustomerLookupPage,
+  })),
+);
+const SaleActivitiesPage = lazy(() =>
+  import("@/modules/sale/pages/sale-activities-page").then((module) => ({
+    default: module.SaleActivitiesPage,
+  })),
+);
+const SaleRemindersPage = lazy(() =>
+  import("@/modules/sale/pages/sale-reminders-page").then((module) => ({
+    default: module.SaleRemindersPage,
+  })),
+);
+const SaleKpiPage = lazy(() =>
+  import("@/modules/sale/pages/sale-kpi-page").then((module) => ({
+    default: module.SaleKpiPage,
+  })),
+);
+const SaleCustomFieldsPage = lazy(() =>
+  import("@/modules/custom-fields/pages/sale-custom-fields-page").then((module) => ({
+    default: module.SaleCustomFieldsPage,
+  })),
+);
+const MarketingCustomFieldsPage = lazy(() =>
+  import("@/modules/custom-fields/pages/marketing-custom-fields-page").then((module) => ({
+    default: module.MarketingCustomFieldsPage,
+  })),
+);
+const AdmissionCustomFieldsPage = lazy(() =>
+  import("@/modules/custom-fields/pages/admission-custom-fields-page").then((module) => ({
+    default: module.AdmissionCustomFieldsPage,
+  })),
+);
+const AdmissionsListPage = lazy(() =>
+  import("@/modules/admissions/pages/admissions-list-page").then((module) => ({
+    default: module.AdmissionsListPage,
+  })),
+);
+const AdmissionDocumentsPage = lazy(() =>
+  import("@/modules/admissions/pages/admission-documents-page").then((module) => ({
+    default: module.AdmissionDocumentsPage,
+  })),
+);
+const AdmissionStatusesPage = lazy(() =>
+  import("@/modules/admissions/pages/admission-statuses-page").then((module) => ({
+    default: module.AdmissionStatusesPage,
+  })),
+);
+const AdmissionFeesPage = lazy(() =>
+  import("@/modules/admissions/pages/admission-fees-page").then((module) => ({
+    default: module.AdmissionFeesPage,
+  })),
+);
+const MajorsManagementPage = lazy(() =>
+  import("@/modules/admissions/pages/majors-management-page").then((module) => ({
+    default: module.MajorsManagementPage,
+  })),
+);
+const StudentsListPage = lazy(() =>
+  import("@/modules/students/pages/students-list-page").then((module) => ({
+    default: module.StudentsListPage,
+  })),
+);
+const StudentServicesPage = lazy(() =>
+  import("@/modules/students/pages/student-services-page").then((module) => ({
+    default: module.StudentServicesPage,
+  })),
+);
+const StudentSupportHistoryPage = lazy(() =>
+  import("@/modules/students/pages/student-support-history-page").then((module) => ({
+    default: module.StudentSupportHistoryPage,
+  })),
+);
+const OverviewReportPage = lazy(() =>
+  import("@/modules/reports/pages/overview-report-page").then((module) => ({
+    default: module.OverviewReportPage,
+  })),
+);
+const MarketingDetailReportPage = lazy(() =>
+  import("@/modules/reports/pages/marketing-detail-report-page").then((module) => ({
+    default: module.MarketingDetailReportPage,
+  })),
+);
+const SaleDetailReportPage = lazy(() =>
+  import("@/modules/reports/pages/sale-detail-report-page").then((module) => ({
+    default: module.SaleDetailReportPage,
+  })),
+);
+const AdmissionDetailReportPage = lazy(() =>
+  import("@/modules/reports/pages/admission-detail-report-page").then((module) => ({
+    default: module.AdmissionDetailReportPage,
+  })),
+);
+const StudentDetailReportPage = lazy(() =>
+  import("@/modules/reports/pages/student-detail-report-page").then((module) => ({
+    default: module.StudentDetailReportPage,
+  })),
+);
+const PersonalReportsPage = lazy(() =>
+  import("@/modules/reports/pages/personal-reports-page").then((module) => ({
+    default: module.PersonalReportsPage,
+  })),
+);
+const StatisticsDashboardPage = lazy(() =>
+  import("@/modules/reports/pages/statistics-dashboard-page").then((module) => ({
+    default: module.StatisticsDashboardPage,
+  })),
+);
+const CampaignsListPage = lazy(() =>
+  import("@/modules/marketing/pages/campaigns-list-page").then((module) => ({
+    default: module.CampaignsListPage,
+  })),
+);
+const LeadSourcesPage = lazy(() =>
+  import("@/modules/marketing/pages/lead-sources-page").then((module) => ({
+    default: module.LeadSourcesPage,
+  })),
+);
+const LeadChannelsPage = lazy(() =>
+  import("@/modules/marketing/pages/lead-channels-page").then((module) => ({
+    default: module.LeadChannelsPage,
+  })),
+);
+const UtmTrackingsPage = lazy(() =>
+  import("@/modules/marketing/pages/utm-trackings-page").then((module) => ({
+    default: module.UtmTrackingsPage,
+  })),
+);
+const MarketingFormsPage = lazy(() =>
+  import("@/modules/marketing/pages/marketing-forms-page").then((module) => ({
+    default: module.MarketingFormsPage,
+  })),
+);
+const MarketingFormDetailPage = lazy(() =>
+  import("@/modules/marketing/pages/marketing-forms-page").then((module) => ({
+    default: module.MarketingFormDetailPage,
+  })),
+);
+const PublicMarketingFormPage = lazy(() =>
+  import("@/modules/marketing/pages/public-marketing-form-page").then((module) => ({
+    default: module.PublicMarketingFormPage,
+  })),
+);
+const ConnectionChannelsPage = lazy(() =>
+  import("@/modules/marketing/pages/connection-channels-page").then((module) => ({
+    default: module.ConnectionChannelsPage,
+  })),
+);
+const ZaloConnectionPage = lazy(() =>
+  import("@/modules/marketing/pages/zalo-connection-page").then((module) => ({ default: module.ZaloConnectionPage })),
+);
+const MetaConnectionPage = lazy(() =>
+  import("@/modules/marketing/pages/meta-connection-page").then((module) => ({ default: module.MetaConnectionPage })),
+);
+const CustomerListManagementPage = lazy(() =>
+  import("@/modules/marketing/pages/customer-list-management-page").then((module) => ({
+    default: module.CustomerListManagementPage,
+  })),
+);
+const CustomerListDetailPage = lazy(() =>
+  import("@/modules/marketing/pages/customer-list-management-page").then((module) => ({
+    default: module.CustomerListDetailPage,
+  })),
+);
+const DuplicateLeadsPage = lazy(() =>
+  import("@/modules/marketing/pages/duplicate-leads-page").then((module) => ({
+    default: module.DuplicateLeadsPage,
+  })),
+);
+const AuditLogsPage = lazy(() =>
+  import("@/modules/audit/pages/audit-logs-page").then((module) => ({
+    default: module.AuditLogsPage,
+  })),
+);
+const SaleWorkSchedulesPage = lazy(() => import("@/modules/management/pages/sale-work-schedules-page").then(module => ({ default: module.SaleWorkSchedulesPage })));
+const AutomationRulesPage = lazy(() =>
+  import("@/modules/automations/pages/automation-rules-page").then((module) => ({
+    default: module.AutomationRulesPage,
+  })),
+);
+const AutomationMonitoringPage = lazy(() =>
+  import("@/modules/automations/pages/automation-monitoring-page").then((module) => ({
+    default: module.AutomationMonitoringPage,
+  })),
+);
+const AutomationBuilderPage = lazy(() =>
+  import("@/modules/automations/pages/automation-builder-page").then((module) => ({
+    default: module.AutomationBuilderPage,
+  })),
+);
+
+export function AppRoutes() {
+  return (
+    <Suspense
+      fallback={<RouteLoadingState />}
+    >
+      <Routes>
+        <Route path="/dang-nhap" element={<LoginPage />} />
+        <Route path="/forms/:publicKey" element={<PublicMarketingFormPage />} />
+        <Route path="/bieu-mau/:publicKey" element={<PublicMarketingFormPage />} />
+
+        <Route element={<ProtectedRoute />}>
+          <Route element={<MainLayout />}>
+            <Route element={<ProtectedRoute anyPermissions={["release.view"]} />}>
+              <Route path="/management/releases" element={<ReleasesPage />} />
+            </Route>
+            <Route path="/tong-quan" element={<WorkspacePage />} />
+            <Route path="/khong-co-quyen" element={<ForbiddenPage />} />
+
+            <Route element={<ProtectedRoute anyPermissions={["user.manage"]} />}>
+              <Route path="/quan-ly/nguoi-dung" element={<UsersAccessPage />} />
+            </Route>
+            <Route element={<ProtectedRoute anyPermissions={["role.manage"]} />}>
+              <Route path="/quan-ly/vai-tro" element={<RolesAccessPage />} />
+            </Route>
+            <Route element={<ProtectedRoute anyPermissions={["permission.manage"]} />}>
+              <Route path="/quan-ly/quyen-han" element={<PermissionsAccessPage />} />
+            </Route>
+            <Route element={<ProtectedRoute anyPermissions={["department.manage"]} />}>
+              <Route path="/quan-ly/phong-ban" element={<DepartmentsAccessPage />} />
+            </Route>
+            <Route element={<ProtectedRoute anyPermissions={["pipeline.manage"]} />}>
+              <Route path="/quan-ly/pipeline" element={<PipelinesAccessPage />} />
+            </Route>
+            <Route element={<ProtectedRoute anyPermissions={["system.manage"]} />}>
+              <Route path="/quan-ly/cau-hinh" element={<SystemSettingsPage />} />
+              <Route path="/quan-ly/cau-hinh-hien-thi" element={<DisplayLayoutsPage />} />
+            </Route>
+            <Route element={<ProtectedRoute anyPermissions={["webhook.view", "webhook.manage"]} />}>
+              <Route path="/quan-ly/tich-hop/webhooks" element={<WebhooksPage />} />
+            </Route>
+            <Route element={<ProtectedRoute anyPermissions={["institution_program.manage"]} />}>
+              <Route path="/quan-ly/chuong-trinh" element={<InstitutionProgramsManagementPage />} />
+            </Route>
+            <Route element={<ProtectedRoute anyPermissions={["customer_lookup.view"]} />}>
+              <Route path="/sale/tra-cuu-khach-hang" element={<CustomerLookupPage />} />
+            </Route>
+            <Route
+              element={
+                <ProtectedRoute
+                  anyPermissions={["lead.view_all", "lead.view_department", "lead.view_assigned"]}
+                />
+              }
+            >
+              <Route path="/sale/leads" element={<LeadsListPage />} />
+              <Route path="/sale/leads/:leadId" element={<LeadDetailPage />} />
+              <Route element={<ProtectedRoute anyPermissions={["student.view", "student.view_all"]} />}>
+                <Route path="/sale/students" element={<LeadsListPage audience="students" title="Học viên" detailBasePath="/sale/students" showLeadCreationActions={false} />} />
+                <Route path="/sale/students/:leadId" element={<LeadDetailPage listPath="/sale/students" listLabel="Học viên" eyebrow="CRM Sale / Học viên" />} />
+              </Route>
+              <Route element={<ProtectedRoute anyPermissions={["lead.assign", "lead.reassign"]} />}>
+                <Route path="/sale/phan-cong" element={<LeadAssignmentsPage />} />
+              </Route>
+              <Route path="/sale/hoat-dong" element={<SaleActivitiesPage />} />
+              <Route path="/sale/nhac-viec" element={<SaleRemindersPage />} />
+              <Route path="/sale/kpi" element={<SaleKpiPage />} />
+            </Route>
+            <Route element={<ProtectedRoute anyPermissions={["custom_field.lead.manage", "custom_field.sale_activity.manage", "custom_field.sale_reminder.manage"]} />}>
+              <Route path="/sale/cau-hinh-truong" element={<SaleCustomFieldsPage />} />
+            </Route>
+            <Route element={<ProtectedRoute anyPermissions={["custom_field.marketing_campaign.manage", "custom_field.marketing_form.manage"]} />}>
+              <Route path="/marketing/cau-hinh-truong" element={<MarketingCustomFieldsPage />} />
+            </Route>
+            <Route element={<ProtectedRoute anyPermissions={["custom_field.admission_profile.manage", "custom_field.admission_document.manage", "custom_field.admission_status.manage"]} />}>
+              <Route path="/tuyen-sinh/cau-hinh-truong" element={<AdmissionCustomFieldsPage />} />
+            </Route>
+
+            <Route element={<ProtectedRoute anyPermissions={["admission.view_all", "admission.view", "admission_document.view"]} />}>
+              <Route path="/tuyen-sinh/ho-so" element={<AdmissionsListPage />} />
+              <Route path="/tuyen-sinh/tai-lieu-ho-so" element={<AdmissionDocumentsPage />} />
+              <Route path="/tuyen-sinh/trang-thai-ho-so" element={<AdmissionStatusesPage />} />
+              <Route path="/tuyen-sinh/phi-hoc-phi" element={<AdmissionFeesPage />} />
+            </Route>
+            <Route element={<ProtectedRoute anyPermissions={["admission_major.manage"]} />}>
+              <Route path="/quan-ly/nganh" element={<MajorsManagementPage />} />
+              <Route path="/tuyen-sinh/nganh" element={<Navigate to="/quan-ly/nganh" replace />} />
+            </Route>
+
+            <Route element={<ProtectedRoute anyPermissions={["student.view_all", "student.view"]} />}>
+              <Route path="/sinh-vien/danh-sach" element={<StudentsListPage />} />
+            </Route>
+            <Route element={<ProtectedRoute anyPermissions={["student.view_all", "student_service.view", "student_service.create", "student_service.update"]} />}>
+              <Route path="/sinh-vien/dich-vu" element={<StudentServicesPage />} />
+              <Route path="/sinh-vien/lich-su-ho-tro" element={<StudentSupportHistoryPage />} />
+            </Route>
+
+            <Route element={<ProtectedRoute anyPermissions={["report.view_all"]} />}>
+              <Route path="/bao-cao/tong-hop" element={<OverviewReportPage />} />
+            </Route>
+            <Route element={<ProtectedRoute anyPermissions={["report.view_all", "report.marketing.view", "report.marketing.view_own"]} />}>
+              <Route path="/bao-cao/marketing" element={<MarketingDetailReportPage />} />
+            </Route>
+            <Route element={<ProtectedRoute anyPermissions={["report.view_all", "report.sale.view_department", "report.sale.view_assigned"]} />}>
+              <Route path="/bao-cao/sale" element={<SaleDetailReportPage />} />
+            </Route>
+            <Route element={<ProtectedRoute anyPermissions={["report.personal.view"]} />}>
+              <Route path="/bao-cao/dashboard" element={<StatisticsDashboardPage />} />
+            </Route>
+            <Route element={<ProtectedRoute anyPermissions={["report.view_all", "report.admission.view", "admission.view_all", "admission.view"]} />}>
+              <Route path="/bao-cao/tuyen-sinh" element={<AdmissionDetailReportPage />} />
+            </Route>
+            <Route element={<ProtectedRoute anyPermissions={["report.view_all", "report.student.view", "student.view_all", "student.view"]} />}>
+              <Route path="/bao-cao/sinh-vien" element={<StudentDetailReportPage />} />
+            </Route>
+            <Route element={<ProtectedRoute anyPermissions={["report.personal.view"]} />}>
+              <Route path="/bao-cao/kpi-ca-nhan" element={<PersonalReportsPage />} />
+            </Route>
+
+            <Route element={<ProtectedRoute anyPermissions={["campaign.view_all", "campaign.view", "campaign.view_own"]} />}>
+              <Route path="/marketing/chien-dich" element={<CampaignsListPage />} />
+            </Route>
+            <Route element={<ProtectedRoute anyPermissions={["lead.view_all", "lead.view_department", "lead.view_assigned"]} />}>
+              <Route
+                path="/marketing/danh-sach-khach-hang"
+                element={
+                  <LeadsListPage
+                    eyebrow="CRM Marketing / Khách hàng"
+                    title="Danh sách khách hàng"
+                    description="Danh sách tất cả lead trong phạm vi dữ liệu bạn được quyền truy cập."
+                    detailBasePath="/marketing/danh-sach-khach-hang"
+                    audience="all"
+                    enableCustomerListAssignment
+                  />
+                }
+              />
+              <Route
+                path="/marketing/danh-sach-khach-hang/:leadId"
+                element={
+                  <LeadDetailPage
+                    listPath="/marketing/danh-sach-khach-hang"
+                    listLabel="Danh sách khách hàng"
+                    eyebrow="CRM Marketing / Khách hàng / Chi tiết lead"
+                  />
+                }
+              />
+              <Route path="/marketing/check-trung-data" element={<DuplicateLeadsPage />} />
+              <Route element={<ProtectedRoute anyPermissions={["customer_list.view_all", "customer_list.manage"]} />}>
+                <Route path="/marketing/quan-ly-danh-sach" element={<CustomerListManagementPage />} />
+                <Route path="/marketing/quan-ly-danh-sach/:customerListId" element={<CustomerListDetailPage />} />
+              </Route>
+            </Route>
+            <Route element={<ProtectedRoute anyPermissions={["campaign.view_all", "lead_source.manage"]} />}>
+              <Route path="/marketing/nguon-lead" element={<LeadSourcesPage />} />
+            </Route>
+            <Route element={<ProtectedRoute anyPermissions={["lead_channel.view", "lead_channel.manage"]} />}>
+              <Route path="/marketing/nguon" element={<LeadChannelsPage />} />
+            </Route>
+            <Route element={<ProtectedRoute anyPermissions={["campaign.view_all", "utm.view", "utm.view_own"]} />}>
+              <Route path="/marketing/utm" element={<UtmTrackingsPage />} />
+            </Route>
+            <Route element={<ProtectedRoute anyPermissions={["campaign.view_all", "marketing_form.manage", "marketing_form.create", "marketing_form.update_own"]} />}>
+              <Route path="/marketing/form-survey" element={<MarketingFormsPage />} />
+              <Route path="/marketing/form-survey/:formId" element={<MarketingFormDetailPage />} />
+              <Route path="/marketing/bieu-mau" element={<Navigate to="/marketing/form-survey" replace />} />
+            </Route>
+            <Route element={<ProtectedRoute anyPermissions={["integration.view", "integration.manage"]} />}>
+              <Route path="/marketing/kenh-ket-noi" element={<ConnectionChannelsPage />} />
+              <Route path="/marketing/kenh-ket-noi/zalo" element={<ZaloConnectionPage />} />
+              <Route path="/marketing/kenh-ket-noi/meta" element={<MetaConnectionPage />} />
+            </Route>
+
+            <Route element={<ProtectedRoute anyPermissions={["audit.view"]} />}>
+              <Route path="/he-thong/nhat-ky" element={<AuditLogsPage />} />
+            </Route>
+
+            <Route element={<ProtectedRoute anyPermissions={["automation.manage"]} />}>
+              <Route path="/management/sale-work-schedules" element={<SaleWorkSchedulesPage />} />
+              <Route path="/automations" element={<AutomationRulesPage />} />
+            </Route>
+            <Route element={<ProtectedRoute anyPermissions={["automation.manage", "automation.view", "automation.view_logs", "automation.transfer_owner"]} />}>
+              <Route path="/automations/monitoring" element={<AutomationMonitoringPage />} />
+            </Route>
+          </Route>
+        </Route>
+
+        {/* Automation Builder — full-screen, outside MainLayout */}
+        <Route element={<ProtectedRoute />}>
+          <Route element={<ProtectedRoute anyPermissions={["automation.manage"]} />}>
+            <Route path="/automations/:id/builder" element={<AutomationBuilderPage />} />
+          </Route>
+        </Route>
+
+        <Route path="/" element={<Navigate to="/tong-quan" replace />} />
+        <Route path="*" element={<Navigate to="/tong-quan" replace />} />
+      </Routes>
+    </Suspense>
+  );
+}

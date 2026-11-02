@@ -1,0 +1,98 @@
+import { enrolledStudentWhere } from "../students/student-membership";
+import { prisma } from "../../database/prisma";
+import { applicationStageLeadWhere } from "../leads/pipeline-stage-semantics";
+
+export async function getOverviewReport(institutionProgramId?: string) {
+  const leadWhere = {
+    deleted_at: null,
+    ...(institutionProgramId ? { institution_program_id: institutionProgramId } : {}),
+  };
+  const admissionWhere = {
+    leads: { is: { ...leadWhere, ...applicationStageLeadWhere() } },
+  };
+  const applicationLeadWhere = { ...leadWhere, ...applicationStageLeadWhere() };
+  const studentWhere = { ...enrolledStudentWhere, ...(institutionProgramId ? { institution_program_id: institutionProgramId } : {}) };
+  const [
+    totalLeads,
+    totalApplications,
+    totalStudents,
+    applicationStatusGroups,
+    majorGroups,
+  ] = await prisma.$transaction([
+    prisma.leads.count({ where: leadWhere }),
+    prisma.leads.count({ where: applicationLeadWhere }),
+    prisma.students.count({ where: studentWhere }),
+    prisma.admission_profiles.groupBy({
+      by: ["admission_status_id"],
+      where: admissionWhere,
+      _count: { _all: true },
+      orderBy: { _count: { admission_status_id: "desc" } },
+      take: 10,
+    }),
+    prisma.admission_profiles.groupBy({
+      by: ["major_id"],
+      where: { ...admissionWhere, major_id: { not: null } },
+      _count: { _all: true },
+      orderBy: { _count: { major_id: "desc" } },
+      take: 10,
+    }),
+  ]);
+
+  const [statuses, majors] = await prisma.$transaction([
+    prisma.admission_statuses.findMany({
+      where: {
+        id: {
+          in: applicationStatusGroups.flatMap((group) =>
+            group.admission_status_id ? [group.admission_status_id] : [],
+          ),
+        },
+      },
+      select: { id: true, name: true },
+    }),
+    prisma.majors.findMany({
+      where: {
+        id: { in: majorGroups.flatMap((group) => (group.major_id ? [group.major_id] : [])) },
+      },
+      select: { id: true, name: true },
+    }),
+  ]);
+
+  const statusNames = new Map(statuses.map((status) => [status.id, status.name]));
+  const majorNames = new Map(majors.map((major) => [major.id, major.name]));
+
+  return {
+    summary: {
+      totalLeads,
+      totalApplications,
+      totalStudents,
+      conversionRate: totalLeads === 0 ? 0 : Number(((totalStudents / totalLeads) * 100).toFixed(1)),
+    },
+    applicationsByStatus: applicationStatusGroups.map((group) => ({
+      id: group.admission_status_id,
+      name: group.admission_status_id
+        ? (statusNames.get(group.admission_status_id) ?? "Chưa xác định")
+        : "Chưa có trạng thái",
+      total: group._count._all,
+    })),
+    applicationsByMajor: majorGroups.map((group) => ({
+      id: group.major_id!,
+      name: majorNames.get(group.major_id!) ?? "Chưa xác định",
+      total: group._count._all,
+    })),
+  };
+}
+
+export async function getOverviewReportOptions() {
+  const institutionPrograms = await prisma.institution_programs.findMany({
+    where: { status: "active" },
+    select: { id: true, name: true, institution_name: true },
+    orderBy: { name: "asc" },
+  });
+  return {
+    institutionPrograms: institutionPrograms.map((program) => ({
+      id: program.id,
+      name: program.name,
+      institutionName: program.institution_name,
+    })),
+  };
+}

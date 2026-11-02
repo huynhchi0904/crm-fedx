@@ -1,0 +1,8 @@
+node_modules/
+artifacts/cloud-preparation/
+dist/
+.env
+.env.local
+uploads/**/*
+!uploads/**/
+!uploads/**/.gitkeep

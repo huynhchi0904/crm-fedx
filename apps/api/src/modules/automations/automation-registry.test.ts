@@ -1,0 +1,185 @@
+import assert from "node:assert/strict";
+import test from "node:test";
+
+import { extendCausation, REGISTERED_AUTOMATION_EXECUTOR_TYPES } from "./automation-action-registry";
+import {
+  AUTOMATION_REGISTRY,
+  getAutomationNodeDefinition,
+  validateRegisteredAutomationNode,
+} from "./automation-registry";
+import type { AutomationNode } from "./automation.types";
+
+test("registry exposes every supported builder node with a unique type", () => {
+  const nodeTypes = AUTOMATION_REGISTRY.nodes.map((node) => node.type);
+
+  assert.equal(new Set(nodeTypes).size, nodeTypes.length);
+  assert.deepEqual(nodeTypes, [
+    "action_update_information",
+    "trigger",
+    "condition",
+    "action_notification",
+    "action_assign",
+    "action_assign_pool",
+    "action_update_stage",
+    "action_activity",
+    "action_reminder",
+    "action_message",
+    "action_webhook",
+    "action_create_admission",
+    "action_request_document",
+    "action_update_admission_status",
+    "action_convert_student",
+    "delay",
+  ]);
+});
+
+test("registry describes action configuration for API-driven builder forms", () => {
+  const assign = getAutomationNodeDefinition("action_assign");
+
+  assert.equal(assign?.category, "action");
+  assert.deepEqual(assign?.configFields, [
+    {
+      key: "assignToUserId",
+      label: "Nhân viên phụ trách",
+      control: "select",
+      required: true,
+      optionsSource: "assignees",
+    },
+  ]);
+});
+
+test("registry publishes operators by compatible data type", () => {
+  const contains = AUTOMATION_REGISTRY.operators.find((operator) => operator.code === "contains");
+  const equals = AUTOMATION_REGISTRY.operators.find((operator) => operator.code === "equals");
+
+  assert.deepEqual(contains?.dataTypes, ["TEXT", "TEXTAREA", "EMAIL", "PHONE", "MULTI_SELECT"]);
+  assert.ok(equals?.dataTypes.includes("SELECT"));
+  assert.ok(!contains?.dataTypes.includes("NUMBER"));
+});
+
+test("every executable node is fully registered without orchestrator knowledge", () => {
+  const executableNodes = AUTOMATION_REGISTRY.nodes.filter((node) => node.category !== "trigger");
+
+  assert.deepEqual([...REGISTERED_AUTOMATION_EXECUTOR_TYPES].sort(), executableNodes.map((node) => node.type).sort());
+  assert.ok(executableNodes.every((node) => typeof node.icon === "string" && typeof node.tone === "string"));
+});
+
+test("registry owns node config validation", () => {
+  const invalidAssign: AutomationNode = {
+    id: "assign-1",
+    type: "action_assign",
+    position: { x: 0, y: 0 },
+    data: { label: "Phân công" },
+  };
+
+  assert.deepEqual(validateRegisteredAutomationNode(invalidAssign), ["Node phân công assign-1 chưa chọn nhân viên."]);
+});
+
+test("registry validates the phase 3 assignment pool configuration", () => {
+  const invalidPool: AutomationNode = {
+    id: "pool-1",
+    type: "action_assign_pool",
+    position: { x: 0, y: 0 },
+    data: { label: "Chia Lead", assignmentStrategy: "round_robin", assigneeIds: [] },
+  };
+  const validPool: AutomationNode = {
+    ...invalidPool,
+    data: { ...invalidPool.data, assigneeIds: ["user-1", "user-2"] },
+  };
+
+  assert.equal(validateRegisteredAutomationNode(invalidPool).length, 1);
+  assert.deepEqual(validateRegisteredAutomationNode(validPool), []);
+});
+
+test("registry validates weighted assignment configuration", () => {
+  const weightedPool: AutomationNode = {
+    id: "weighted-pool",
+    type: "action_assign_pool",
+    position: { x: 0, y: 0 },
+    data: {
+      label: "Chia Lead theo trọng số",
+      assignmentStrategy: "weighted",
+      assigneeIds: ["sale-a", "sale-b"],
+      assigneeWeights: [
+        { assigneeId: "sale-a", weight: 2 },
+        { assigneeId: "sale-b", weight: 1 },
+      ],
+    },
+  };
+
+  assert.deepEqual(validateRegisteredAutomationNode(weightedPool), []);
+  assert.equal(validateRegisteredAutomationNode({
+    ...weightedPool,
+    data: {
+      ...weightedPool.data,
+      assigneeWeights: [{ assigneeId: "sale-a", weight: 0 }],
+    },
+  }).length, 1);
+});
+
+test("registry rejects an unsupported assignment strategy", () => {
+  const invalidStrategy = {
+    id: "invalid-strategy",
+    type: "action_assign_pool",
+    position: { x: 0, y: 0 },
+    data: {
+      label: "Chia Lead",
+      assignmentStrategy: "random",
+      assigneeIds: ["sale-a"],
+    },
+  } as unknown as AutomationNode;
+
+  assert.deepEqual(
+    validateRegisteredAutomationNode(invalidStrategy),
+    ["Node chia Lead invalid-strategy dùng chiến lược phân công không được hỗ trợ."],
+  );
+});
+
+test("SLA duration is required only for the unprocessed-lead trigger", () => {
+  const leadCreated: AutomationNode = {
+    id: "trigger-1",
+    type: "trigger",
+    position: { x: 0, y: 0 },
+    data: { label: "Lead mới", triggerType: "lead_created" },
+  };
+  const unprocessed: AutomationNode = {
+    ...leadCreated,
+    data: { label: "Lead chưa xử lý", triggerType: "lead_unprocessed" },
+  };
+
+  assert.deepEqual(validateRegisteredAutomationNode(leadCreated), []);
+  assert.equal(validateRegisteredAutomationNode(unprocessed).length, 1);
+});
+
+test("registry publishes system fields and sensitive metadata for the builder", () => {
+  const phone = AUTOMATION_REGISTRY.fields.find((field) => field.reference === "system:phone");
+  const pipelineStage = AUTOMATION_REGISTRY.fields.find((field) => field.reference === "system:pipelineStageId");
+
+  assert.equal(phone?.dataType, "PHONE");
+  assert.equal(phone?.isSensitive, true);
+  assert.equal(pipelineStage?.optionSource, "pipelineStages");
+});
+
+test("phase 5 registry exposes admission triggers and actions without hardcoded statuses", () => {
+  assert.ok(AUTOMATION_REGISTRY.triggers.some((trigger) => trigger.code === "admission_profile_created"));
+  assert.ok(AUTOMATION_REGISTRY.triggers.some((trigger) => trigger.code === "admission_profile_expiring"));
+  assert.equal(getAutomationNodeDefinition("action_update_admission_status")?.configFields[0]?.optionsSource, "admissionStatuses");
+  assert.equal(getAutomationNodeDefinition("action_create_admission")?.configFields[0]?.optionsSource, "majors");
+});
+
+test("admission expiry trigger requires a non-negative lead time", () => {
+  const trigger: AutomationNode = {
+    id: "trigger-expiry",
+    type: "trigger",
+    position: { x: 0, y: 0 },
+    data: { label: "Hồ sơ sắp hết hạn", triggerType: "admission_profile_expiring" },
+  };
+
+  assert.equal(validateRegisteredAutomationNode(trigger).length, 1);
+  assert.deepEqual(validateRegisteredAutomationNode({ ...trigger, data: { ...trigger.data, expiryLeadDays: 7 } }), []);
+});
+
+test("admission actions preserve downstream events without re-entering prior rules", () => {
+  assert.deepEqual(extendCausation({ ruleId: "rule-b", causationRuleIds: ["rule-a", "rule-b"] }), ["rule-a", "rule-b"]);
+  assert.deepEqual(extendCausation({ ruleId: "rule-c", causationRuleIds: ["rule-a", "rule-b"] }), ["rule-a", "rule-b", "rule-c"]);
+});
